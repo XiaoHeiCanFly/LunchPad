@@ -1,0 +1,4 @@
+"CFBundleDisplayName" = "LunchPad";
+"CFBundleName" = "LunchPad";
+"NSAccessibilityUsageDescription" = "LunchPad 需要辅助功能权限来监听触控板手势和全局快捷键，并在启动台显示期间阻止桌面切换。";
+"NSInputMonitoringUsageDescription" = "LunchPad 需要监听触控板捏合手势，以便像原生启动台一样随手指打开。";

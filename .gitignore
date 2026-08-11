@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# Xcode user-specific state (not for sharing)
+xcuserdata/
+*.xcuserstate
+
+# Build artifacts
+DerivedData/
+build/
+*.build/
+
+# Claude Code local configuration (machine-specific)
+.claude/
