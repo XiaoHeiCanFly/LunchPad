@@ -671,6 +671,15 @@ final class LauncherController: ObservableObject {
 
     private func rebuildPanels() {
         panels.forEach { $0.close() }
+        // Reset presented state so the next show()/toggle() starts clean.
+        // Without this, unplugging the display that held the launcher leaves
+        // isPresented = true with an empty panels array, which jams the
+        // show/hide state machine (show() returns early, toggle() calls
+        // hide() on an already-hidden controller, menu bar stays stuck on
+        // "关闭 LunchPad").
+        animator.snap(to: 0)
+        setPresented(false)
+        showIntent = false
         store.resetAdaptiveGrid()
         refreshDisplayOptions()
         guard let screen = presentationScreen() else { panels = []; panelDisplayID = nil; return }
