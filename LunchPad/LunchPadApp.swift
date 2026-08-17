@@ -21,6 +21,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var defaultsObserver: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // macOS 26 (Tahoe) 会自动给菜单项加上图标（如状态栏菜单里
+        // “设置…” 前面的图标）。该偏好按应用域生效，只影响 LunchPad
+        // 自己的菜单，不影响用户全局设置或其他应用。
+        UserDefaults.standard.set(false, forKey: "NSMenuEnableActionImages")
         if let icon = NSImage(named: "LaunchpadIcon") {
             NSApp.applicationIconImage = resizedDockIcon(from: icon)
         }
@@ -87,11 +91,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         guard statusItem == nil else { return }
 
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        // 不设置 button.image：macOS 26 会把状态栏按钮的图标同时渲染到
-        // 下拉菜单顶部（即菜单项上方的图标）。用纯文字标题替代图标，
-        // 下拉菜单里就不会再出现该图标。
-        item.button?.title = "LunchPad"
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        if let image = NSImage(systemSymbolName: "square.grid.3x3.fill", accessibilityDescription: "LunchPad") {
+            image.isTemplate = true
+            item.button?.image = image
+        }
         item.button?.toolTip = "LunchPad"
         let menu = NSMenu()
         menu.delegate = self
