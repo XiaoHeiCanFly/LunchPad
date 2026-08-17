@@ -535,23 +535,157 @@ enum PreviewWindowUtil {
     }
 
     /// Captures a single window by CGWindowID using the CGS hardware capture API.
-    nonisolated static func captureWindowImage(windowID: CGWindowID, pid: pid_t) async throws -> CGImage {
+    ///
+    /// WindowServer occasionally returns a transitional surface whose width is
+    /// only a fraction of the real window (most often while an app is updating
+    /// or moving between Spaces).  Do not hand that frame to SwiftUI: its
+    /// aspect ratio makes a normal landscape window look like a thin portrait
+    /// slice.  Validate against the actual CG window bounds, retry briefly, and
+    /// finally use ScreenCaptureKit's desktop-independent window capture.
+    nonisolated static func captureWindowImage(
+        windowID: CGWindowID,
+        pid: pid_t,
+        expectedSize: CGSize? = nil
+    ) async throws -> CGImage {
         guard shouldCaptureWindowImages() else { throw captureError }
 
+        for attempt in 0 ..< 3 {
+            if let capturedImage = captureCGSWindowImage(windowID: windowID),
+               captureGeometryIsValid(capturedImage, expectedSize: expectedSize)
+            {
+                return scaledPreviewImage(capturedImage)
+            }
+
+            // A bad WindowServer surface is normally replaced on the next
+            // compositor frame. Keep this delay short so Dock hover remains
+            // responsive while avoiding three captures of the same bad frame.
+            if attempt < 2 {
+                try? await Task.sleep(for: .milliseconds(18))
+            }
+        }
+
+        let fallback = try await captureScreenCaptureKitWindowImage(
+            windowID: windowID,
+            pid: pid,
+            expectedSize: expectedSize
+        )
+        guard captureGeometryIsValid(fallback, expectedSize: expectedSize) else {
+            throw captureError
+        }
+        return scaledPreviewImage(fallback)
+    }
+
+    nonisolated private static func captureCGSWindowImage(windowID: CGWindowID) -> CGImage? {
         let connectionID = CGSMainConnectionID()
         var windowIDUInt32 = UInt32(windowID)
         let quality: CGSWindowCaptureOptions = Defaults.shared.windowImageCaptureQuality == .best ? .bestResolution : .nominalResolution
-        guard let capturedWindows = CGSHWCaptureWindowList(
+        return (CGSHWCaptureWindowList(
             connectionID,
             &windowIDUInt32,
             1,
             [.ignoreGlobalClipShape, quality]
-        ) as? [CGImage],
-            let capturedImage = capturedWindows.first
-        else {
-            throw captureError
-        }
+        ) as? [CGImage])?.first
+    }
 
+    nonisolated private static func captureGeometryIsValid(_ image: CGImage, expectedSize: CGSize?) -> Bool {
+        guard image.width >= 2, image.height >= 2 else { return false }
+        guard let expectedSize,
+              expectedSize.width >= 2,
+              expectedSize.height >= 2
+        else { return true }
+
+        let expectedAspect = expectedSize.width / expectedSize.height
+        let capturedAspect = CGFloat(image.width) / CGFloat(image.height)
+        guard expectedAspect.isFinite, capturedAspect.isFinite,
+              expectedAspect > 0, capturedAspect > 0
+        else { return false }
+
+        // Title bars and app-specific window decorations can introduce a small
+        // discrepancy. A half-width capture is around 2x wrong, so 30% keeps
+        // legitimate windows while reliably rejecting the broken surface.
+        let aspectError = max(expectedAspect / capturedAspect, capturedAspect / expectedAspect)
+        return aspectError <= 1.30 && captureVisibleContentCoverageIsValid(image)
+    }
+
+    /// Some broken CGS frames retain the expected canvas size but only paint a
+    /// narrow strip in its centre. Sample alpha coverage as well as dimensions
+    /// so those frames cannot slip through the aspect-ratio check.
+    nonisolated private static func captureVisibleContentCoverageIsValid(_ image: CGImage) -> Bool {
+        let sampleWidth = 48
+        let sampleHeight = 48
+        let bytesPerPixel = 4
+        let bytesPerRow = sampleWidth * bytesPerPixel
+        var pixels = [UInt8](repeating: 0, count: bytesPerRow * sampleHeight)
+        let drewImage = pixels.withUnsafeMutableBytes { storage -> Bool in
+            guard let baseAddress = storage.baseAddress,
+                  let context = CGContext(
+                      data: baseAddress,
+                      width: sampleWidth,
+                      height: sampleHeight,
+                      bitsPerComponent: 8,
+                      bytesPerRow: bytesPerRow,
+                      space: CGColorSpaceCreateDeviceRGB(),
+                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                  )
+            else { return false }
+            context.interpolationQuality = .low
+            context.draw(image, in: CGRect(x: 0, y: 0, width: sampleWidth, height: sampleHeight))
+            return true
+        }
+        guard drewImage else { return true }
+
+        var minX = sampleWidth
+        var maxX = -1
+        var minY = sampleHeight
+        var maxY = -1
+        for y in 0 ..< sampleHeight {
+            for x in 0 ..< sampleWidth {
+                let alpha = pixels[y * bytesPerRow + x * bytesPerPixel + 3]
+                guard alpha > 12 else { continue }
+                minX = min(minX, x)
+                maxX = max(maxX, x)
+                minY = min(minY, y)
+                maxY = max(maxY, y)
+            }
+        }
+        guard maxX >= minX, maxY >= minY else { return false }
+        let widthCoverage = CGFloat(maxX - minX + 1) / CGFloat(sampleWidth)
+        let heightCoverage = CGFloat(maxY - minY + 1) / CGFloat(sampleHeight)
+        return widthCoverage >= 0.68 && heightCoverage >= 0.68
+    }
+
+    nonisolated private static func captureScreenCaptureKitWindowImage(
+        windowID: CGWindowID,
+        pid: pid_t,
+        expectedSize: CGSize?
+    ) async throws -> CGImage {
+        let content = try await SCShareableContent.excludingDesktopWindows(
+            false,
+            onScreenWindowsOnly: false
+        )
+        guard let window = content.windows.first(where: {
+            $0.windowID == windowID && $0.owningApplication?.processID == pid
+        }) else { throw captureError }
+
+        let sourceSize = expectedSize ?? window.frame.size
+        guard sourceSize.width >= 2, sourceSize.height >= 2 else { throw captureError }
+
+        let backingScale = NSScreen.main?.backingScaleFactor ?? 2
+        let outputScale = max(1, backingScale)
+        let configuration = SCStreamConfiguration()
+        configuration.width = max(2, Int(sourceSize.width * outputScale))
+        configuration.height = max(2, Int(sourceSize.height * outputScale))
+        configuration.showsCursor = false
+        configuration.scalesToFit = true
+        configuration.captureResolution = .best
+
+        return try await SCScreenshotManager.captureImage(
+            contentFilter: SCContentFilter(desktopIndependentWindow: window),
+            configuration: configuration
+        )
+    }
+
+    nonisolated private static func scaledPreviewImage(_ capturedImage: CGImage) -> CGImage {
         let previewScale = max(1, Defaults.shared.windowPreviewImageScale)
         guard previewScale > 1 else { return capturedImage }
 
@@ -667,6 +801,13 @@ enum PreviewWindowUtil {
         let sharingState = (cgEntry[kCGWindowSharingState as String] as? NSNumber)?.intValue ?? 1
         guard layer == 0, alpha > 0.01, sharingState != 0 else { return nil }
 
+        let cgBounds: CGRect? = if let boundsDictionary = cgEntry[kCGWindowBounds as String] as? NSDictionary {
+            CGRect(dictionaryRepresentation: boundsDictionary)
+        } else {
+            nil
+        }
+        let expectedCaptureSize = cgBounds?.size ?? size
+
         let primaryScreenMaxY = NSScreen.screens.first?.frame.maxY ?? 0
         let frame = CGRect(
             x: position.x,
@@ -701,7 +842,11 @@ enum PreviewWindowUtil {
         // 最小化/隐藏的窗口也尝试截图：CGS 硬件捕获能取到部分最小化窗口
         // 的内容，失败时卡片自然回退到占位图。
         if captureImage {
-            image = try? await captureWindowImage(windowID: windowID, pid: app.processIdentifier)
+            image = try? await captureWindowImage(
+                windowID: windowID,
+                pid: app.processIdentifier,
+                expectedSize: expectedCaptureSize
+            )
         }
 
         return PreviewWindow(
