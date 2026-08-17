@@ -98,6 +98,7 @@ final class LauncherController: ObservableObject {
         installHotKey()
         installEventMonitors()
         installRawTrackpadMonitorIfAllowed()
+        DockHoverObserver.shared.start()
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
             object: nil, queue: .main
@@ -159,6 +160,8 @@ final class LauncherController: ObservableObject {
         if let m = localMonitor { NSEvent.removeMonitor(m) }
         if let m = globalSystemKeyMonitor { NSEvent.removeMonitor(m) }
         if let m = globalModifierMonitor { NSEvent.removeMonitor(m) }
+        DockHoverObserver.shared.stop()
+        DockPreviewPanel.shared.hideWindow()
         panels.forEach { $0.contentView = nil; $0.orderOut(nil); $0.close() }
         panels.removeAll()
         uninstallDialogPanel?.contentView = nil; uninstallDialogPanel?.close()
@@ -168,6 +171,8 @@ final class LauncherController: ObservableObject {
     // MARK: - Show / Hide
 
     func show(animated: Bool = true) {
+        // The launcher and the Dock-hover preview never coexist.
+        DockPreviewPanel.shared.hideWindow()
         showIntent = true
         // Defensive: if a drag was interrupted without ever reaching a drop,
         // make sure the launcher never reappears with a stuck dragged icon.
@@ -295,6 +300,7 @@ final class LauncherController: ObservableObject {
     /// Presents the panels if the gesture is opening the launcher.
     private func prepareGesturePresentation() {
         guard !isPresented else { return }
+        DockPreviewPanel.shared.hideWindow()
         preparePresentationPanelsIfNeeded()
         setPresented(true)
         setSpaceSwitchingHotKeysEnabled(true)
@@ -380,6 +386,9 @@ final class LauncherController: ObservableObject {
             case .keyDown:
                 return self.handleKeyDown(event)
             case .systemDefined:
+                if DockPreviewPanel.shared.isVisible {
+                    if self.isMissionControlKeyDown(event) { DockPreviewPanel.shared.hideWindow(); return event }
+                }
                 if self.isPresented && self.isMissionControlKeyDown(event) {
                     self.hide(animated: false); return event
                 }
@@ -393,6 +402,7 @@ final class LauncherController: ObservableObject {
                     self.handleScroll(event); return nil
                 }
             case .swipe:
+                if DockPreviewPanel.shared.isVisible { DockPreviewPanel.shared.hideWindow(); return event }
                 if self.isPresented { self.hide(animated: false); return event }
             case .otherMouseDown:
                 if event.buttonNumber == 3 { self.store.pageBackward(); return nil }
@@ -404,6 +414,17 @@ final class LauncherController: ObservableObject {
     }
 
     private func handleKeyDown(_ event: NSEvent) -> NSEvent? {
+        // While the Dock-hover preview is up it owns the keyboard:
+        // Esc dismisses it and everything else is consumed so shortcuts
+        // (⌘Q, ⌘W…) can't reach the backgrounded app through our key panel.
+        if DockPreviewPanel.shared.isVisible {
+            if event.keyCode == UInt16(kVK_Escape) {
+                DockPreviewPanel.shared.hideWindow()
+            } else {
+                _ = DockPreviewPanel.shared.handleNavigationKey(Int(event.keyCode))
+            }
+            return nil
+        }
         if isPresented {
             let arrows = [kVK_LeftArrow, kVK_RightArrow, kVK_UpArrow, kVK_DownArrow]
             if event.keyCode == UInt16(kVK_F3)
@@ -514,6 +535,24 @@ final class LauncherController: ObservableObject {
                 if type.rawValue == 20, RawTrackpadGestureMonitor.pendingBeginGesture {
                     RawTrackpadGestureMonitor.pendingBeginGesture = false
                     return nil
+                }
+                // The dock-hover preview panel keeps the background application
+                // inactive, so navigation keys are handled at the session tap.
+                if type == .keyDown, DockPreviewPanel.isPresentedOnScreen {
+                    let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+                    let handledKeys: Set<Int64> = [36, 53, 76, 123, 124, 125, 126]
+                    if handledKeys.contains(keyCode) {
+                        DispatchQueue.main.async {
+                            MainActor.assumeIsolated {
+                                if keyCode == 53 {
+                                    DockPreviewPanel.shared.hideWindow()
+                                } else {
+                                    _ = DockPreviewPanel.shared.handleNavigationKey(Int(keyCode))
+                                }
+                            }
+                        }
+                        return nil
+                    }
                 }
                 // keyDown: trigger the configured shortcut even when the app is
                 // backgrounded. The trigger is dispatched async — never sync.
@@ -757,6 +796,7 @@ final class LauncherController: ObservableObject {
         accessibilityPermissionGranted = AXIsProcessTrusted()
         if accessibilityPermissionGranted && !was {
             installGlobalEventMonitors(); installSystemEventTap(); installRawTrackpadMonitorIfAllowed()
+            DockHoverObserver.shared.start()
         }
     }
 

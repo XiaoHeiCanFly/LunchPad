@@ -17,14 +17,10 @@ struct LunchPadApp: App {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    private var launchedSilently = false
     private var statusItem: NSStatusItem?
     private var defaultsObserver: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let launchEvent = NSAppleEventManager.shared().currentAppleEvent
-        launchedSilently = launchEvent?.eventID == kAEOpenApplication
-            && launchEvent?.paramDescriptor(forKeyword: keyAELaunchedAsLogInItem) != nil
         if let icon = NSImage(named: "LaunchpadIcon") {
             NSApp.applicationIconImage = resizedDockIcon(from: icon)
         }
@@ -38,16 +34,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 (NSApp.delegate as? AppDelegate)?.configureStatusItem()
             }
         }
-        LauncherController.shared.start(silently: launchedSilently)
-        if launchedSilently {
-            DispatchQueue.main.async {
-                NSApp.windows.forEach { $0.orderOut(nil) }
-            }
+        // Always launch silently. The launcher appears on demand (hotkey,
+        // Dock icon, or menu bar) — never as a surprise window at startup,
+        // whether the app was started at login or opened by hand.
+        LauncherController.shared.start(silently: true)
+        DispatchQueue.main.async {
+            NSApp.windows.forEach { $0.orderOut(nil) }
         }
     }
 
     func applicationShouldRestoreApplicationState(_ app: NSApplication) -> Bool {
-        !launchedSilently
+        false
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -184,6 +181,16 @@ private struct LauncherSettingsView: View {
     @AppStorage("keyboard-shortcut-label") private var keyboardShortcutLabel = "F4"
     @AppStorage("display-mode") private var displayMode = "active"
     @AppStorage("fixed-display-id") private var fixedDisplayID = 0
+    @AppStorage("dock-hover-expose") private var dockHoverExpose = true
+    @AppStorage("hover-open-delay") private var hoverOpenDelay = 0.2
+    @AppStorage("buffer-from-dock") private var bufferFromDock = -20.0
+    @AppStorage("show-app-name") private var showAppName = true
+    @AppStorage("show-animations") private var showAnimations = true
+    @AppStorage("include-hidden-windows") private var includeHiddenWindows = true
+    @AppStorage("show-current-space-only") private var showCurrentSpaceOnly = false
+    @AppStorage("show-current-monitor-only") private var showCurrentMonitorOnly = false
+    @AppStorage("ignore-single-window-apps") private var ignoreSingleWindowApps = false
+    @State private var screenRecordingGranted = CGPreflightScreenCaptureAccess()
 
     var body: some View {
         Form {
@@ -260,6 +267,47 @@ private struct LauncherSettingsView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            Section("Dock 悬停") {
+                Toggle("悬停 Dock 图标显示窗口", isOn: $dockHoverExpose)
+                LabeledContent("悬停延迟") {
+                    Slider(value: $hoverOpenDelay, in: 0.1...1.5, step: 0.1)
+                        .frame(width: 180)
+                    Text("\(hoverOpenDelay, specifier: "%.1f") 秒")
+                        .monospacedDigit()
+                        .frame(width: 52, alignment: .trailing)
+                }
+                LabeledContent("与 Dock 的间距") {
+                    Slider(value: Binding(
+                        get: { bufferFromDock + 20 },
+                        set: { bufferFromDock = $0 - 20 }
+                    ), in: -40...40, step: 1)
+                        .frame(width: 180)
+                    Text("\(Int(bufferFromDock + 20))")
+                        .monospacedDigit()
+                        .frame(width: 32, alignment: .trailing)
+                }
+                .onChange(of: bufferFromDock) { _, _ in
+                    DockPreviewPanel.shared.refreshDockSpacing()
+                }
+                Toggle("显示应用名称", isOn: $showAppName)
+                Toggle("显示动画", isOn: $showAnimations)
+                Toggle("包含最小化与隐藏的窗口", isOn: $includeHiddenWindows)
+                Toggle("仅显示当前桌面的窗口", isOn: $showCurrentSpaceOnly)
+                Toggle("仅显示当前显示器的窗口", isOn: $showCurrentMonitorOnly)
+                Toggle("单窗口应用不显示预览", isOn: $ignoreSingleWindowApps)
+                HStack {
+                    LabeledContent("窗口预览权限") {
+                        Text(screenRecordingGranted ? "屏幕录制已允许" : "需要屏幕录制权限")
+                            .foregroundStyle(screenRecordingGranted ? .green : .secondary)
+                    }
+                    if !screenRecordingGranted {
+                        Button("授权") { requestScreenRecordingPermission() }
+                    }
+                }
+                Text("鼠标停留在 Dock 中正在运行的应用图标上，会在图标旁显示该应用的窗口预览；点击窗口切换到该窗口，移开鼠标自动关闭。辅助功能权限用于识别 Dock 悬停，屏幕录制权限用于生成窗口预览图。")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
             Section("应用与布局") {
                 Stepper("每行 \(columns) 个应用", value: $columns, in: 5...10)
                 Stepper("每页 \(rows) 行", value: $rows, in: 3...7)
@@ -316,6 +364,17 @@ private struct LauncherSettingsView: View {
             controller.refreshAccessibilityPermission()
             controller.refreshLoginItemStatus()
             controller.refreshDisplayOptions()
+            screenRecordingGranted = CGPreflightScreenCaptureAccess()
+        }
+    }
+
+    private func requestScreenRecordingPermission() {
+        guard CGRequestScreenCaptureAccess() else { return }
+        Task { @MainActor in
+            for _ in 0..<20 where !screenRecordingGranted {
+                try? await Task.sleep(for: .milliseconds(500))
+                screenRecordingGranted = CGPreflightScreenCaptureAccess()
+            }
         }
     }
 }

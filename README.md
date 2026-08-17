@@ -27,6 +27,7 @@
 - Magic Mouse/触控板精确滚动以一个手势周期为单位锁定，每次最多翻一页并忽略惯性阶段
 - 可分别控制 Dock 图标与菜单栏图标显隐，并使用系统登录项服务设置开机启动
 - Dock 图标、菜单栏图标和 F4 都可以重复开关 LunchPad
+- 鼠标停留在 Dock 中正在运行的应用图标上，在图标旁以 DockDoor 同款方式弹出该应用的窗口预览浮层：毛玻璃卡片、应用名头部、方向键/Return 键盘导航、移开鼠标自动淡出
 - Reduce Motion 与 Reduce Transparency 无障碍降级
 
 ## 构建
@@ -42,5 +43,7 @@
 开机启动使用 `SMAppService.mainApp`，要求应用经过代码签名；Xcode 正常运行或归档的签名构建可直接注册，使用 `CODE_SIGNING_ALLOWED=NO` 生成的临时调试包只能验证界面与编译。
 
 “卸载”只把应用本体移到废纸篓，不会静默清除容器、缓存或偏好设置，避免误删用户数据。
+
+Dock 悬停预览基于 [DockDoor](https://github.com/ejbills/DockDoor) 的 GPLv3 源码迁移并针对 LunchPad 做了集成：通过辅助功能订阅 Dock 的 `kAXSelectedChildrenChangedNotification` 获得悬停图标（不依赖鼠标坐标命中检测），窗口列表来自 AX/CGWindow 联合筛选，预览图使用 CGS 硬件窗口捕获，面板定位依赖 Dock 方向。该功能同时依赖辅助功能和屏幕录制权限，并使用了若干稳定的私有符号（`CoreDockGetOrientationAndPinning`、`CGSHWCaptureWindowList`、`_AXUIElementGetWindow`、SkyLight 置顶等，与 DockDoor 相同）；这些符号不适用于 App Store 分发，仅适合开发者签名/Sparkle 类分发渠道。版权与许可说明见 [NOTICE.md](NOTICE.md) 和 [LICENSE](LICENSE)。
 
 功能取舍参考了 [LaunchOS 的功能说明](https://launchosapp.com/features/)，实现代码为本项目独立编写。

@@ -20,7 +20,14 @@ nonisolated final class LauncherWallpaperCache: @unchecked Sendable {
         guard let url else { return nil }
         // Retaining native 5K/6K wallpaper pixels only wastes memory without
         // improving visible detail (the image is blurred anyway).
-        let maximumPixelSize = min(1_600, max(1_024, Int(max(screenSize.width, screenSize.height))))
+        // A zero-blur backdrop must retain Retina detail. Blurred launcher
+        // backgrounds can remain smaller because their high frequencies are
+        // intentionally removed, but Exposé uses the sharp wallpaper.
+        let requestedScale: CGFloat = blurRadius <= 0.5 ? 2 : 1
+        let maximumPixelSize = min(
+            blurRadius <= 0.5 ? 3_840 : 1_600,
+            max(1_024, Int(max(screenSize.width, screenSize.height) * requestedScale))
+        )
         let key = "\(url.path)#\(maximumPixelSize)#blur\(Int(blurRadius))" as NSString
         if let cached = cache.object(forKey: key) { return cached }
         guard let source = CGImageSourceCreateWithURL(url as CFURL, [
