@@ -732,14 +732,14 @@ struct PreviewWindowCard: View {
             .materialPill()
             .allowsHitTesting((finalIsSelected || isHovering))
         } else if window.isMinimized || window.isHidden {
-            // 与流量灯按钮（17pt 图标 + 4pt 内边距 + 胶囊）同高，
-            // 避免最小化卡片的工具栏行比其他卡片更高。
+            // 与流量灯按钮（14pt 图标 + 2pt 内边距 + 胶囊）完全同构同高，
+            // 文字用 caption 字号避免在定高框内溢出。
             Text(window.isMinimized ? "最小化" : "已隐藏")
-                .font(.subheadline)
+                .font(.caption)
                 .italic()
                 .foregroundStyle(.secondary)
-                .frame(height: 17)
-                .padding(4)
+                .frame(height: 14)
+                .padding(2)
                 .materialPill()
         }
     }
