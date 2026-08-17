@@ -87,11 +87,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         guard statusItem == nil else { return }
 
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        if let image = NSImage(systemSymbolName: "square.grid.3x3.fill", accessibilityDescription: "LunchPad") {
-            image.isTemplate = true
-            item.button?.image = image
-        }
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        // 不设置 button.image：macOS 26 会把状态栏按钮的图标同时渲染到
+        // 下拉菜单顶部（即菜单项上方的图标）。用纯文字标题替代图标，
+        // 下拉菜单里就不会再出现该图标。
+        item.button?.title = "LunchPad"
         item.button?.toolTip = "LunchPad"
         let menu = NSMenu()
         menu.delegate = self
