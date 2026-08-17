@@ -732,13 +732,14 @@ struct PreviewWindowCard: View {
             .materialPill()
             .allowsHitTesting((finalIsSelected || isHovering))
         } else if window.isMinimized || window.isHidden {
+            // 与右侧窗口标题胶囊保持一致的天然高度（不强制 34pt），
+            // 避免最小化卡片因工具栏变高而比其他卡片更高。
             Text(window.isMinimized ? "最小化" : "已隐藏")
                 .font(.subheadline)
                 .italic()
                 .foregroundStyle(.secondary)
                 .padding(4)
                 .materialPill()
-                .frame(height: 34)
         }
     }
 }
@@ -913,10 +914,7 @@ struct DockPreviewHoverContainer: View {
             var updated = window
             if updated.toggleMinimize() != nil {
                 state.windows[index] = updated
-                if updated.isMinimized {
-                    // A minimized window can no longer be captured; drop its image.
-                    state.windows[index].image = nil
-                }
+                // 保留最后捕获的窗口内容，最小化卡片仍显示窗口画面。
             }
         case .toggleFullScreen:
             var updated = window

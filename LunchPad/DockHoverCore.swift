@@ -698,7 +698,9 @@ enum PreviewWindowUtil {
         }
 
         var image: CGImage?
-        if captureImage, !isMinimized, !isHidden {
+        // 最小化/隐藏的窗口也尝试截图：CGS 硬件捕获能取到部分最小化窗口
+        // 的内容，失败时卡片自然回退到占位图。
+        if captureImage {
             image = try? await captureWindowImage(windowID: windowID, pid: app.processIdentifier)
         }
 
