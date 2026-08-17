@@ -828,7 +828,7 @@ final class Defaults {
             "prevent-preview-reentry-during-fade-out": false,
             "uniform-card-radius": true,
             "selection-opacity": 0.4,
-            "unselected-content-opacity": 0.75,
+            "unselected-content-opacity": 1.0,
             "show-window-title": true,
         ])
     }
