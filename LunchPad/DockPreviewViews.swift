@@ -732,12 +732,13 @@ struct PreviewWindowCard: View {
             .materialPill()
             .allowsHitTesting((finalIsSelected || isHovering))
         } else if window.isMinimized || window.isHidden {
-            // 与右侧窗口标题胶囊保持一致的天然高度（不强制 34pt），
-            // 避免最小化卡片因工具栏变高而比其他卡片更高。
+            // 与流量灯按钮（17pt 图标 + 4pt 内边距 + 胶囊）同高，
+            // 避免最小化卡片的工具栏行比其他卡片更高。
             Text(window.isMinimized ? "最小化" : "已隐藏")
                 .font(.subheadline)
                 .italic()
                 .foregroundStyle(.secondary)
+                .frame(height: 17)
                 .padding(4)
                 .materialPill()
         }
