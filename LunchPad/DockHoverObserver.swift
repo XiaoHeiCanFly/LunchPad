@@ -249,6 +249,27 @@ final class DockHoverObserver {
         getSelectedDockItem()
     }
 
+    /// Returns the stable edge of the Dock AX list. Unlike an individual icon
+    /// frame, this boundary does not move when Dock magnification changes.
+    func dockBoundary(on screen: NSScreen, position: DockPosition) -> CGFloat? {
+        guard let dockList = subscribedDockList,
+              let origin = try? dockList.position(),
+              let size = try? dockList.size()
+        else { return nil }
+
+        switch position {
+        case .bottom:
+            // AX uses a top-left origin; the converted Y is the list's top edge.
+            return Self.cgPointFromNSPoint(origin, forScreen: screen).y
+        case .left:
+            return origin.x + size.width
+        case .right:
+            return origin.x
+        default:
+            return nil
+        }
+    }
+
     private func getSelectedDockItem() -> AXUIElement? {
         guard let dockAppPID = currentDockPID else { return nil }
         let dockAppElement = AXUIElementCreateApplication(dockAppPID)

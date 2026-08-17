@@ -354,7 +354,10 @@ final class DockPreviewPanel: NSPanel {
                 CGPoint(x: frame.maxX - newSize.width, y: frame.midY - newSize.height / 2)
             }
         case .bottom:
-            CGPoint(x: frame.midX - newSize.width / 2, y: frame.minY)
+            CGPoint(
+                x: frame.midX - newSize.width / 2,
+                y: fixedBottomDockOriginY(on: screen)
+            )
         default:
             CGPoint(x: frame.midX - newSize.width / 2, y: frame.midY - newSize.height / 2)
         }
@@ -390,38 +393,41 @@ final class DockPreviewPanel: NSPanel {
 
         var xPosition: CGFloat
         var yPosition: CGFloat
+        let dockSpacing = Defaults.shared.dockSpacing
+        // The panel contains transparent layout padding outside its visible
+        // glass surface. Position the visible edge, not the NSPanel frame.
+        let visibleSurfaceInset = HoverContainerPadding.container + HoverContainerPadding.dockStyleOuter
 
         switch dockPosition {
         case .bottom:
             xPosition = flippedIconRect.midX - (windowSize.width / 2)
-            yPosition = flippedIconRect.minY
+            yPosition = fixedBottomDockOriginY(on: screen)
         case .left:
-            xPosition = flippedIconRect.maxX
+            let stableDockBoundary = DockHoverObserver.shared.dockBoundary(on: screen, position: dockPosition)
+            let dockRight = stableDockBoundary ?? screen.visibleFrame.minX
+            xPosition = dockRight + dockSpacing - visibleSurfaceInset
             yPosition = flippedIconRect.midY - (windowSize.height / 2) - flippedIconRect.height
         case .right:
-            xPosition = screenFrame.maxX - flippedIconRect.width - windowSize.width
+            let stableDockBoundary = DockHoverObserver.shared.dockBoundary(on: screen, position: dockPosition)
+            let dockLeft = stableDockBoundary ?? screen.visibleFrame.maxX
+            xPosition = dockLeft - windowSize.width - dockSpacing + visibleSurfaceInset
             yPosition = flippedIconRect.minY - (windowSize.height / 2)
         default:
             xPosition = mouseLocation.x - (windowSize.width / 2)
             yPosition = mouseLocation.y - (windowSize.height / 2)
         }
 
-        let bufferFromDock = Defaults.shared.bufferFromDock
-        switch dockPosition {
-        case .left:
-            xPosition += bufferFromDock
-        case .right:
-            xPosition -= bufferFromDock
-        case .bottom:
-            yPosition += bufferFromDock
-        default:
-            break
-        }
-
         xPosition = max(screenFrame.minX, min(xPosition, screenFrame.maxX - windowSize.width))
         yPosition = max(screenFrame.minY, min(yPosition, screenFrame.maxY - windowSize.height))
 
         return CGPoint(x: xPosition, y: yPosition)
+    }
+
+    /// Locks the visible glass surface—not the transparent NSPanel frame—to a
+    /// fixed distance above the system's reserved Dock boundary.
+    private func fixedBottomDockOriginY(on screen: NSScreen) -> CGFloat {
+        let visibleSurfaceInset = HoverContainerPadding.container + HoverContainerPadding.dockStyleOuter
+        return screen.visibleFrame.minY + Defaults.shared.dockSpacing - visibleSurfaceInset
     }
 
     /// Repositions an already visible preview when the Dock-spacing setting

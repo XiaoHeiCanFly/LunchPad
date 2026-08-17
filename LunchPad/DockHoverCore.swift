@@ -848,6 +848,11 @@ final class Defaults {
         }
         return double("buffer-from-dock")
     }
+    /// User-facing spacing where 0 is the historical -20 DockDoor baseline.
+    nonisolated var dockSpacing: CGFloat {
+        guard UserDefaults.standard.object(forKey: "buffer-from-dock") != nil else { return 0 }
+        return double("buffer-from-dock") + 20
+    }
     nonisolated var anchorDockPreviewPosition: Bool { bool("anchor-dock-preview-position") }
     nonisolated var showAnimations: Bool { bool("show-animations") }
     nonisolated var previewMaxColumns: Int { int("preview-max-columns") }
