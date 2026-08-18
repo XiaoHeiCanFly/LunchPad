@@ -101,6 +101,10 @@ final class LauncherStore: ObservableObject {
     @Published var dragTargetID: String?
     @Published var folderCandidateID: String?
     @Published var aliasRequest: LauncherApplication?
+    /// Set while dragging an application OUT of a folder; the drop routes to
+    /// `moveApplication(fromFolder:onto:)` instead of the root-entry path.
+    private var draggedFolderID: UUID?
+    private var draggedFolderApplication: LauncherApplication?
     @Published var aliasDraft = ""
     @Published private(set) var runtimeGridColumns = 0
     @Published private(set) var runtimeGridRows = 0
@@ -640,6 +644,19 @@ final class LauncherStore: ObservableObject {
         startDragWatchdog()
     }
 
+    /// Starts a drag that carries an application out of a folder. The source
+    /// lives inside a folder entry, so the drop path differs from root drags.
+    func beginFolderDrag(_ application: LauncherApplication, folderID: UUID) {
+        draggedEntryID = application.id
+        draggedFolderID = folderID
+        draggedFolderApplication = application
+        dragTargetID = nil
+        folderCandidateID = nil
+        dragHoverStartedAt = .distantPast
+        dragBeganAt = Date()
+        startDragWatchdog()
+    }
+
     private func startDragWatchdog() {
         dragWatchdog?.invalidate()
         let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
@@ -713,6 +730,12 @@ final class LauncherStore: ObservableObject {
     }
 
     func completeDrop(on target: LauncherEntry, locationX: CGFloat? = nil, tileWidth: CGFloat = 0) {
+        // Drags that started inside a folder take a different path: the source
+        // is not a root entry, so the root reorder/merge logic does not apply.
+        if draggedFolderID != nil {
+            completeFolderDrag(on: target, locationX: locationX, tileWidth: tileWidth)
+            return
+        }
         if folderCandidateID == target.id {
             // Folder merge/create keeps working in every mode — no prompt.
             moveDraggedEntry(onto: target)
@@ -731,6 +754,49 @@ final class LauncherStore: ObservableObject {
         else { pendingReorderPlaceAfter = lastDragPlaceAfter }
         endDrag()
         reorderToCustomPrompt = true
+    }
+
+    /// Drop landing for an app dragged out of a folder. Centered on an app or
+    /// dropped onto a folder merges it in; otherwise it is inserted into the
+    /// root entries next to the target.
+    private func completeFolderDrag(on target: LauncherEntry, locationX: CGFloat?, tileWidth: CGFloat) {
+        guard let folderID = draggedFolderID, let application = draggedFolderApplication else {
+            endDrag()
+            return
+        }
+        // Dropping back onto the folder it came from is a no-op.
+        if target.id == "folder:\(folderID.uuidString)" {
+            endDrag()
+            return
+        }
+        if folderCandidateID == target.id {
+            moveApplication(application, fromFolder: folderID, onto: target)
+        } else {
+            remove(application: application, fromFolder: folderID, promoteSingleton: false)
+            let placeAfter = locationX.map { $0 > tileWidth / 2 } ?? false
+            if let targetIndex = entries.firstIndex(where: { $0.id == target.id }) {
+                let insertIndex = min(entries.count, targetIndex + (placeAfter ? 1 : 0))
+                entries.insert(.application(application), at: insertIndex)
+            } else {
+                entries.append(.application(application))
+            }
+            normalizeFolders()
+            save()
+        }
+        endDrag()
+    }
+
+    /// Drop on blank space: pull the app out of its folder onto the root grid.
+    func dropDraggedFolderAppToRoot() {
+        guard let folderID = draggedFolderID, let application = draggedFolderApplication else {
+            endDrag()
+            return
+        }
+        remove(application: application, fromFolder: folderID, promoteSingleton: false)
+        entries.append(.application(application))
+        normalizeFolders()
+        save()
+        endDrag()
     }
 
     /// The user confirmed switching to custom sorting for a dropped reorder.
@@ -777,6 +843,8 @@ final class LauncherStore: ObservableObject {
     func endDrag(saveLayout: Bool = false) {
         dragWatchdog?.invalidate(); dragWatchdog = nil
         draggedEntryID = nil
+        draggedFolderID = nil
+        draggedFolderApplication = nil
         dragTargetID = nil
         folderCandidateID = nil
         dragHoverStartedAt = .distantPast
@@ -1203,6 +1271,9 @@ final class LauncherStore: ObservableObject {
         var roots = ["/Applications", "/System/Applications"]
         let userApplications = fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Applications").path
         if fileManager.fileExists(atPath: userApplications) { roots.append(userApplications) }
+        // Launch Services 未注册的 .app 在启动台、聚焦和访达的智能视图中
+        // 都不显示；注册表查询失败时返回 nil，表示不过滤。
+        let registeredPaths = registeredApplicationPaths()
         var results: [String: LauncherApplication] = [:]
 
         for root in roots {
@@ -1216,10 +1287,16 @@ final class LauncherStore: ObservableObject {
                 guard url.pathExtension.caseInsensitiveCompare("app") == .orderedSame else { continue }
                 enumerator.skipDescendants()
                 guard let bundle = Bundle(url: url) else { continue }
+                // macOS 的启动台/聚焦不显示纯菜单栏应用（LSUIElement）和
+                // 后台代理应用（LSBackgroundOnly），LunchPad 保持一致。
+                let lsuiElement = (bundle.object(forInfoDictionaryKey: "LSUIElement") as? NSNumber)?.boolValue ?? false
+                let lsBackgroundOnly = (bundle.object(forInfoDictionaryKey: "LSBackgroundOnly") as? NSNumber)?.boolValue ?? false
+                if lsuiElement || lsBackgroundOnly { continue }
+                let standardizedPath = url.resolvingSymlinksInPath().standardizedFileURL.path
+                if let registeredPaths, !registeredPaths.contains(standardizedPath) { continue }
                 let displayName = (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
                     ?? (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String)
                     ?? url.deletingPathExtension().lastPathComponent
-                let standardizedPath = url.resolvingSymlinksInPath().standardizedFileURL.path
                 let protected = standardizedPath.hasPrefix("/System/")
                 results[standardizedPath] = LauncherApplication(
                     name: displayName,
@@ -1231,6 +1308,19 @@ final class LauncherStore: ObservableObject {
         }
 
         return results.values.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    /// All bundle paths the system has registered with Launch Services,
+    /// resolved to their real (symlink-free) standardized paths.
+    nonisolated private static func registeredApplicationPaths() -> Set<String>? {
+        guard let cls = NSClassFromString("LSApplicationWorkspace") as? NSObject.Type,
+              let workspace = cls.perform(NSSelectorFromString("defaultWorkspace"))?.takeUnretainedValue(),
+              let apps = workspace.perform(NSSelectorFromString("allApplications"))?.takeUnretainedValue() as? [AnyObject]
+        else { return nil }
+        return Set(apps.compactMap { app -> String? in
+            guard let url = app.perform(NSSelectorFromString("bundleURL"))?.takeUnretainedValue() as? URL else { return nil }
+            return url.resolvingSymlinksInPath().standardizedFileURL.path
+        })
     }
 }
 

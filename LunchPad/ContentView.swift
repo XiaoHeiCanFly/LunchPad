@@ -161,6 +161,12 @@ private struct PagesGrid: View {
                     Color.clear
                         .contentShape(Rectangle())
                         .onTapGesture { controller.hide() }
+                        // Dropping an app dragged out of a folder onto blank
+                        // space places it at the end of the root grid.
+                        .onDrop(of: [UTType.fileURL, UTType.utf8PlainText], isTargeted: nil) { _ in
+                            store.dropDraggedFolderAppToRoot()
+                            return true
+                        }
 
                     if abs(pageIndex - store.currentPage) <= 1 {
                         LazyVGrid(columns: metrics.gridItems, spacing: 6) {
@@ -1358,6 +1364,17 @@ private struct FolderApplicationTile: View {
                 .shadow(color: .black.opacity(0.7), radius: 2, y: 1)
         }
         .frame(maxWidth: .infinity)
+        .onDrag {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.74)) {
+                store.beginFolderDrag(application, folderID: folderID)
+            }
+            return NSItemProvider(object: application.url as NSURL)
+        } preview: {
+            HighResolutionApplicationDragPreview(path: application.path, size: iconSize)
+                .padding(12)
+                .background(.black.opacity(0.10), in: RoundedRectangle(cornerRadius: iconSize * 0.30, style: .continuous))
+                .shadow(color: .black.opacity(0.34), radius: 18, y: 12)
+        }
         .contextMenu {
             Button("打开") { controller.launch(application) }
             Button("重命名…") { store.requestAlias(for: application) }
