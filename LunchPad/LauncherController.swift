@@ -223,6 +223,8 @@ final class LauncherController: ObservableObject {
         store.openFolderID = nil
         store.searchText = ""
         store.optionIsPressed = false
+        // 关闭界面时清掉错误提示，避免上次打开失败的信息残留到下次打开。
+        store.errorMessage = nil
         // A drag can be interrupted when the launcher closes mid-drag (the
         // window is hidden before the drop completes, so `performDrop` never
         // runs). End it so the dragged icon isn't left in the dragged state
@@ -940,13 +942,16 @@ final class LauncherController: ObservableObject {
         // Hide FIRST so the launcher closes while the app launches — previously
         // hide() ran in openApplication's completion, which only fires after the
         // target app has launched AND activated, adding a visible beat before
-        // the close animation even started. On failure, just surface the error
-        // without bringing the launcher back.
+        // the close animation even started.
         hide()
         NSWorkspace.shared.openApplication(at: application.url, configuration: cfg) { _, error in
             guard let err = error?.localizedDescription else { return }
             Task { @MainActor in
-                LauncherController.shared.store.errorMessage = "无法打开\u{201C}\(name)\u{201D}：\(err)"
+                let c = LauncherController.shared
+                c.store.errorMessage = "无法打开\u{201C}\(name)\u{201D}：\(err)"
+                // 界面已在启动时关闭，提示不可见且会残留到下次打开；
+                // 把启动台带回来显示错误，用户关闭界面后提示即被清除。
+                if !c.isPresented { c.show() }
             }
         }
     }
