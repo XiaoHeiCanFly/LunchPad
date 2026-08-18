@@ -710,13 +710,18 @@ final class LauncherStore: ObservableObject {
 
     func updateDrag(over target: LauncherEntry, locationX: CGFloat, tileWidth: CGFloat) {
         guard draggedEntryID != nil, draggedEntryID != target.id else { return }
-        // 从文件夹拖出的应用一旦进入根网格区域，关闭文件夹浮层。
-        if draggedSourceFolderID != nil {
-            openFolderID = nil
-        }
         let targetIsFolder: Bool
         if case .folder = target { targetIsFolder = true }
         else { targetIsFolder = false }
+        // 从文件夹拖出的应用：一旦进入根网格区域就关闭文件夹浮层；
+        // 首次悬停到应用磁贴上时把源取出放入根网格（按落点位置），
+        // 让实时让位预览与落点逻辑与根网格拖拽完全一致。
+        if draggedSourceFolderID != nil {
+            openFolderID = nil
+            if !targetIsFolder {
+                pullDraggedSourceIntoRootEntries(at: target, locationX: locationX, tileWidth: tileWidth)
+            }
+        }
         let centerBand = max(44, tileWidth * 0.46)
         let centered = targetIsFolder || abs(locationX - tileWidth / 2) < centerBand / 2
 
@@ -898,6 +903,22 @@ final class LauncherStore: ObservableObject {
         return application
     }
 
+    /// 把拖出的源从文件夹取出，按落点位置插入根网格；
+    /// 之后实时预览、落点与取消还原都走根网格逻辑。
+    private func pullDraggedSourceIntoRootEntries(at target: LauncherEntry, locationX: CGFloat, tileWidth: CGFloat) {
+        guard draggedSourceFolderID != nil, let application = removeDraggedSource() else { return }
+        let placeAfter = locationX > tileWidth / 2
+        if let targetIndex = entries.firstIndex(where: { $0.id == target.id }) {
+            entries.insert(.application(application), at: min(entries.count, targetIndex + (placeAfter ? 1 : 0)))
+        } else {
+            entries.append(.application(application))
+        }
+        draggedSourceFolderID = nil
+        draggedFolderApplication = nil
+        // 源文件夹可能因此被清空或只剩一个应用，立即解散/合并。
+        normalizeFolders()
+    }
+
     /// 把应用合并到目标（应用 → 创建文件夹；文件夹 → 移入）。
     private func mergeApplication(_ application: LauncherApplication, onto target: LauncherEntry) {
         guard let targetIndex = entries.firstIndex(where: { $0.id == target.id }) else {
@@ -1016,6 +1037,11 @@ final class LauncherStore: ObservableObject {
 
     /// Drop on blank space: pull the app out of its folder onto the root grid.
     func dropDraggedFolderAppToRoot() {
+        // 拖拽期间源已取出到根网格（有实时预览位置）：保留当前位置即可。
+        guard draggedSourceFolderID != nil else {
+            endDrag()
+            return
+        }
         guard let application = removeDraggedSource() else {
             endDrag()
             return
