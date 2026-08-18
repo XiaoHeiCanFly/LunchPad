@@ -112,7 +112,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         addMenuItem("重新扫描应用", action: #selector(rescanApplications), to: menu)
         menu.addItem(.separator())
-        addMenuItem("设置…", action: #selector(openSettings), to: menu)
+        addMenuItem("设置…", action: #selector(showPreferences), to: menu)
         addMenuItem("退出 LunchPad", action: #selector(terminateApplication), to: menu)
     }
 
@@ -130,7 +130,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         LauncherController.shared.store.scanApplications()
     }
 
-    @objc private func openSettings() {
+    // Selector 故意不叫 openSettings:/showSettingsWindow: —— macOS 26 会按
+    // selector 名给“设置”类菜单项自动加齿轮图标，且不受
+    // NSMenuEnableActionImages 控制（已实测确认）。
+    @objc private func showPreferences() {
         NSApp.activate(ignoringOtherApps: true)
         // The classic `showSettingsWindow:` hack no longer opens the SwiftUI
         // Settings scene on macOS 26 — `sendAction` returns true but nothing
