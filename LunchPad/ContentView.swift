@@ -1254,6 +1254,12 @@ private struct FolderOverlay: View {
                 // root backdrop's `BlankAreaCatcher`.
                 BlankAreaCatcher(onDismiss: { closeFolder() })
                     .frame(width: proxy.size.width, height: proxy.size.height)
+                    // 拖拽中：浮层空白区域吞掉落点，避免穿透到根网格磁贴
+                    // 触发误关闭/误排序；落点由文件夹磁贴自行处理。
+                    .onDrop(of: [UTType.fileURL, UTType.utf8PlainText], isTargeted: nil) { _ in
+                        store.folderDragExited()
+                        return true
+                    }
 
                 VStack(spacing: 30) {
                     TextField("文件夹名称", text: $name)
@@ -1280,10 +1286,12 @@ private struct FolderOverlay: View {
                                 FolderApplicationTile(
                                     application: application,
                                     folderID: folder.id,
-                                    iconSize: folderIconSize
+                                    iconSize: folderIconSize,
+                                    tileWidth: cellWidth
                                 )
                             }
                         }
+                        .animation(reduceMotion ? nil : .spring(response: 0.36, dampingFraction: 0.82, blendDuration: 0.12), value: folder.applications)
                         .padding(.horizontal, horizontalPadding)
                         .padding(.vertical, 32)
                     }
@@ -1333,6 +1341,17 @@ private struct FolderApplicationTile: View {
     let application: LauncherApplication
     let folderID: UUID
     let iconSize: CGFloat
+    let tileWidth: CGFloat
+
+    private var isDragged: Bool {
+        store.draggedEntryID == application.id && store.draggedSourceFolderID == folderID
+    }
+
+    private var isFolderDropTarget: Bool {
+        store.draggedEntryID != nil
+            && store.draggedEntryID != application.id
+            && store.dragTargetID == application.id
+    }
 
     var body: some View {
         VStack(spacing: 8) {
@@ -1364,6 +1383,10 @@ private struct FolderApplicationTile: View {
                 .shadow(color: .black.opacity(0.7), radius: 2, y: 1)
         }
         .frame(maxWidth: .infinity)
+        .scaleEffect(isDragged ? 0.88 : (isFolderDropTarget ? 1.06 : 1))
+        .opacity(isDragged ? 0.24 : 1)
+        .animation(.spring(response: 0.30, dampingFraction: 0.74), value: isDragged)
+        .animation(.spring(response: 0.30, dampingFraction: 0.74), value: isFolderDropTarget)
         .onDrag {
             withAnimation(.spring(response: 0.28, dampingFraction: 0.74)) {
                 store.beginFolderDrag(application, folderID: folderID)
@@ -1375,6 +1398,15 @@ private struct FolderApplicationTile: View {
                 .background(.black.opacity(0.10), in: RoundedRectangle(cornerRadius: iconSize * 0.30, style: .continuous))
                 .shadow(color: .black.opacity(0.34), radius: 18, y: 12)
         }
+        .onDrop(
+            of: [UTType.fileURL, UTType.utf8PlainText],
+            delegate: FolderEntryDropDelegate(
+                application: application,
+                folderID: folderID,
+                tileWidth: tileWidth,
+                store: store
+            )
+        )
         .contextMenu {
             Button("打开") { controller.launch(application) }
             Button("重命名…") { store.requestAlias(for: application) }
@@ -1385,6 +1417,39 @@ private struct FolderApplicationTile: View {
                 Button("卸载应用", role: .destructive) { store.requestUninstall(application) }
             }
         }
+    }
+}
+
+/// 文件夹网格磁贴的拖放委托：支持文件夹内排序与从外部拖入。
+private struct FolderEntryDropDelegate: DropDelegate {
+    let application: LauncherApplication
+    let folderID: UUID
+    let tileWidth: CGFloat
+    let store: LauncherStore
+
+    func dropEntered(info: DropInfo) {
+        store.updateFolderDrag(over: application, folderID: folderID, locationX: info.location.x, tileWidth: tileWidth)
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        store.updateFolderDrag(over: application, folderID: folderID, locationX: info.location.x, tileWidth: tileWidth)
+        return DropProposal(operation: .move)
+    }
+
+    func dropExited(info: DropInfo) {
+        store.folderDragExited()
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        withAnimation(.spring(response: 0.48, dampingFraction: 0.76, blendDuration: 0.12)) {
+            store.completeFolderDrop(
+                on: application,
+                folderID: folderID,
+                locationX: info.location.x,
+                tileWidth: tileWidth
+            )
+        }
+        return true
     }
 }
 

@@ -101,10 +101,15 @@ final class LauncherStore: ObservableObject {
     @Published var dragTargetID: String?
     @Published var folderCandidateID: String?
     @Published var aliasRequest: LauncherApplication?
-    /// Set while dragging an application OUT of a folder; the drop routes to
-    /// `moveApplication(fromFolder:onto:)` instead of the root-entry path.
-    private var draggedFolderID: UUID?
+    /// 拖拽源当前所在的文件夹；nil 表示源在根网格。拖拽开始时确定，
+    /// 中途合并进自动创建的文件夹时更新，落点逻辑据此路由。
+    var draggedSourceFolderID: UUID?
     private var draggedFolderApplication: LauncherApplication?
+    /// 拖拽开始时的 entries 快照：拖拽取消时还原，让图标动画回到原位。
+    private var dragStartEntries: [LauncherEntry]?
+    /// 拖拽是否正悬停在某个文件夹的磁贴上（用于“拖出文件夹自动关闭”）。
+    private var folderDragIsActive = false
+    private var lastFolderPreviewReorderAt = Date.distantPast
     @Published var aliasDraft = ""
     @Published private(set) var runtimeGridColumns = 0
     @Published private(set) var runtimeGridRows = 0
@@ -631,12 +636,17 @@ final class LauncherStore: ObservableObject {
             folder.applications.append(sourceApplication)
             entries[targetIndex] = .folder(folder)
         }
+        dragStartEntries = nil
         endDrag()
         save()
     }
 
     func beginDrag(_ entry: LauncherEntry) {
         draggedEntryID = entry.id
+        draggedSourceFolderID = nil
+        draggedFolderApplication = nil
+        folderDragIsActive = false
+        dragStartEntries = entries
         dragTargetID = nil
         folderCandidateID = nil
         dragHoverStartedAt = .distantPast
@@ -648,13 +658,29 @@ final class LauncherStore: ObservableObject {
     /// lives inside a folder entry, so the drop path differs from root drags.
     func beginFolderDrag(_ application: LauncherApplication, folderID: UUID) {
         draggedEntryID = application.id
-        draggedFolderID = folderID
+        draggedSourceFolderID = folderID
         draggedFolderApplication = application
+        folderDragIsActive = false
+        dragStartEntries = entries
         dragTargetID = nil
         folderCandidateID = nil
         dragHoverStartedAt = .distantPast
         dragBeganAt = Date()
         startDragWatchdog()
+        // 拖出文件夹：一旦拖拽没有落在文件夹磁贴上，自动关闭文件夹浮层，
+        // 露出根网格方便确定落点。仍在文件夹内排序时保持打开。
+        scheduleFolderCloseIfAbandoned(folderID: folderID, delay: 0.25)
+    }
+
+    /// 拖拽期间自动打开的文件夹，若指针迟迟没有进入文件夹磁贴区域
+    /// （用户实际在往外拖），自动关闭，避免浮层挡住根网格。
+    private func scheduleFolderCloseIfAbandoned(folderID: UUID, delay: TimeInterval) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.draggedEntryID != nil,
+                  self.openFolderID == folderID, !self.folderDragIsActive
+            else { return }
+            self.openFolderID = nil
+        }
     }
 
     private func startDragWatchdog() {
@@ -679,11 +705,15 @@ final class LauncherStore: ObservableObject {
         // grace period lets the session actually start before we watch.
         let leftButtonHeld = NSEvent.pressedMouseButtons & 1 != 0
         guard !leftButtonHeld, Date().timeIntervalSince(dragBeganAt) > 0.4 else { return }
-        endDrag()
+        endDrag(revertPreview: true)
     }
 
     func updateDrag(over target: LauncherEntry, locationX: CGFloat, tileWidth: CGFloat) {
         guard draggedEntryID != nil, draggedEntryID != target.id else { return }
+        // 从文件夹拖出的应用一旦进入根网格区域，关闭文件夹浮层。
+        if draggedSourceFolderID != nil {
+            openFolderID = nil
+        }
         let targetIsFolder: Bool
         if case .folder = target { targetIsFolder = true }
         else { targetIsFolder = false }
@@ -701,6 +731,21 @@ final class LauncherStore: ObservableObject {
                           self.dragTargetID == targetID, self.dragIsCentered else { return }
                     self.folderCandidateID = targetID
                 }
+                // 悬停 1.5 秒：自动把两个应用合并成文件夹并打开，
+                // 拖拽不结束，可继续在文件夹内排序。
+                let sourceInRoot = self.draggedSourceFolderID == nil
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                    guard let self, self.draggedEntryID != nil,
+                          self.dragTargetID == targetID, self.dragIsCentered,
+                          self.draggedSourceFolderID == nil, sourceInRoot,
+                          self.folderCandidateID == targetID
+                    else { return }
+                    if let folderID = self.autoCreateFolder(on: target) {
+                        self.folderCandidateID = nil
+                        self.openFolderID = folderID
+                        self.scheduleFolderCloseIfAbandoned(folderID: folderID, delay: 1.2)
+                    }
+                }
             }
         }
 
@@ -710,6 +755,18 @@ final class LauncherStore: ObservableObject {
             // preview reordering here, otherwise a folder at the end of a row is
             // pushed onto the next row just as the pointer enters it.
             folderCandidateID = target.id
+            // 悬停 1.5 秒：自动打开文件夹，允许继续拖入并排序。
+            if case .folder(let folder) = target, folder.id != draggedSourceFolderID {
+                let folderID = folder.id
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                    guard let self, self.draggedEntryID != nil,
+                          self.dragTargetID == "folder:\(folderID.uuidString)",
+                          self.openFolderID != folderID
+                    else { return }
+                    self.openFolderID = folderID
+                    self.scheduleFolderCloseIfAbandoned(folderID: folderID, delay: 1.2)
+                }
+            }
             return
         }
         if centered {
@@ -729,10 +786,172 @@ final class LauncherStore: ObservableObject {
         }
     }
 
+    /// 文件夹磁贴上悬停（拖入/文件夹内排序的实时反馈）。
+    func updateFolderDrag(over targetApplication: LauncherApplication, folderID: UUID, locationX: CGFloat, tileWidth: CGFloat) {
+        guard draggedEntryID != nil, draggedEntryID != targetApplication.id else { return }
+        folderDragIsActive = true
+        dragTargetID = targetApplication.id
+        dragHoverStartedAt = Date()
+        let centerBand = max(44, tileWidth * 0.46)
+        let centered = abs(locationX - tileWidth / 2) < centerBand / 2
+        dragIsCentered = centered
+        if centered {
+            folderCandidateID = targetApplication.id
+            return
+        }
+        folderCandidateID = nil
+        lastDragPlaceAfter = locationX > tileWidth / 2
+        // 仅当源就在本文件夹内时实时预览排序。
+        guard draggedSourceFolderID == folderID else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastFolderPreviewReorderAt) >= 0.06 else { return }
+        lastFolderPreviewReorderAt = now
+        previewFolderReorder(over: targetApplication, folderID: folderID, placeAfter: lastDragPlaceAfter)
+    }
+
+    /// 指针离开文件夹磁贴。
+    func folderDragExited() {
+        folderDragIsActive = false
+        dragTargetID = nil
+        folderCandidateID = nil
+        dragHoverStartedAt = .distantPast
+    }
+
+    /// 在文件夹磁贴上松开：源已在本文件夹内则按位置排序；
+    /// 否则把源从当前位置移入文件夹的目标位置。
+    func completeFolderDrop(on targetApplication: LauncherApplication, folderID: UUID, locationX: CGFloat?, tileWidth: CGFloat) {
+        guard let sourceID = draggedEntryID, sourceID != targetApplication.id else {
+            endDrag()
+            return
+        }
+        let placeAfter = locationX.map { $0 > tileWidth / 2 } ?? lastDragPlaceAfter
+        if draggedSourceFolderID == folderID {
+            // 同文件夹排序：以落点位置为准移动（实时预览仅作视觉反馈）。
+            guard let application = draggedFolderApplication else {
+                endDrag()
+                return
+            }
+            remove(application: application, fromFolder: folderID, promoteSingleton: false)
+            insertIntoFolder(application, folderID: folderID, near: targetApplication, placeAfter: placeAfter)
+            dragStartEntries = nil
+            normalizeFolders()
+            save()
+        } else {
+            guard let application = removeDraggedSource() else {
+                endDrag()
+                return
+            }
+            insertIntoFolder(application, folderID: folderID, near: targetApplication, placeAfter: placeAfter)
+            dragStartEntries = nil
+            normalizeFolders()
+            save()
+        }
+        endDrag()
+    }
+
+    /// 文件夹内磁贴上的实时让位预览。
+    private func previewFolderReorder(over target: LauncherApplication, folderID: UUID, placeAfter: Bool) {
+        guard let sourceID = draggedEntryID, sourceID != target.id,
+              draggedSourceFolderID == folderID,
+              let index = entries.firstIndex(where: {
+                  if case .folder(let folder) = $0 { return folder.id == folderID }
+                  return false
+              }),
+              case .folder(var folder) = entries[index],
+              let sourceIndex = folder.applications.firstIndex(where: { $0.id == sourceID }),
+              let oldTargetIndex = folder.applications.firstIndex(where: { $0.id == target.id })
+        else { return }
+        let desiredIndex = oldTargetIndex + (placeAfter ? 1 : 0)
+        if sourceIndex == desiredIndex || sourceIndex + 1 == desiredIndex { return }
+        let source = folder.applications.remove(at: sourceIndex)
+        let adjusted = desiredIndex > sourceIndex ? desiredIndex - 1 : desiredIndex
+        folder.applications.insert(source, at: min(max(0, adjusted), folder.applications.count))
+        entries[index] = .folder(folder)
+    }
+
+    /// 把应用插入文件夹中目标应用旁边（placeAfter 决定前后）。
+    private func insertIntoFolder(_ application: LauncherApplication, folderID: UUID, near target: LauncherApplication, placeAfter: Bool) {
+        guard let index = entries.firstIndex(where: {
+            if case .folder(let folder) = $0 { return folder.id == folderID }
+            return false
+        }), case .folder(var folder) = entries[index] else { return }
+        if let targetIndex = folder.applications.firstIndex(where: { $0.id == target.id }) {
+            let insertIndex = min(folder.applications.count, targetIndex + (placeAfter ? 1 : 0))
+            folder.applications.insert(application, at: insertIndex)
+        } else {
+            folder.applications.append(application)
+        }
+        entries[index] = .folder(folder)
+    }
+
+    /// 从当前位置（根网格或源文件夹）取出拖拽中的应用。
+    @discardableResult
+    private func removeDraggedSource() -> LauncherApplication? {
+        guard let sourceID = draggedEntryID else { return nil }
+        if let folderID = draggedSourceFolderID, let application = draggedFolderApplication {
+            remove(application: application, fromFolder: folderID, promoteSingleton: false)
+            return application
+        }
+        guard let index = entries.firstIndex(where: { $0.id == sourceID }),
+              case .application(let application) = entries[index] else { return nil }
+        entries.remove(at: index)
+        return application
+    }
+
+    /// 把应用合并到目标（应用 → 创建文件夹；文件夹 → 移入）。
+    private func mergeApplication(_ application: LauncherApplication, onto target: LauncherEntry) {
+        guard let targetIndex = entries.firstIndex(where: { $0.id == target.id }) else {
+            entries.append(.application(application))
+            save()
+            return
+        }
+        switch entries[targetIndex] {
+        case .application(let targetApplication):
+            entries[targetIndex] = .folder(LauncherFolder(
+                id: UUID(),
+                name: suggestedFolderName(for: [targetApplication, application]),
+                applications: [targetApplication, application],
+                createdAt: Date()
+            ))
+        case .folder(var folder):
+            guard !folder.applications.contains(where: { $0.id == application.id }) else { return }
+            folder.applications.append(application)
+            entries[targetIndex] = .folder(folder)
+        }
+        normalizeFolders()
+        save()
+    }
+
+    /// 悬停 1.5 秒后立即创建文件夹并打开（拖拽状态保留，可继续排序）。
+    @discardableResult
+    private func autoCreateFolder(on target: LauncherEntry) -> UUID? {
+        guard let sourceID = draggedEntryID, sourceID != target.id,
+              let sourceIndex = entries.firstIndex(where: { $0.id == sourceID }),
+              case .application(let sourceApplication) = entries[sourceIndex],
+              let targetIndex = entries.firstIndex(where: { $0.id == target.id }),
+              case .application(let targetApplication) = entries[targetIndex]
+        else { return nil }
+        entries.remove(at: sourceIndex)
+        let adjustedTarget = targetIndex > sourceIndex ? targetIndex - 1 : targetIndex
+        let folder = LauncherFolder(
+            id: UUID(),
+            name: suggestedFolderName(for: [targetApplication, sourceApplication]),
+            applications: [targetApplication, sourceApplication],
+            createdAt: Date()
+        )
+        entries[adjustedTarget] = .folder(folder)
+        // 源已进入文件夹：更新拖拽源位置，后续落点按“文件夹内”处理。
+        draggedSourceFolderID = folder.id
+        draggedFolderApplication = sourceApplication
+        dragStartEntries = nil
+        save()
+        return folder.id
+    }
+
     func completeDrop(on target: LauncherEntry, locationX: CGFloat? = nil, tileWidth: CGFloat = 0) {
-        // Drags that started inside a folder take a different path: the source
-        // is not a root entry, so the root reorder/merge logic does not apply.
-        if draggedFolderID != nil {
+        // The source currently lives inside a folder: the drop routes through
+        // the folder-aware path (insert next to the target / merge).
+        if draggedSourceFolderID != nil {
             completeFolderDrag(on: target, locationX: locationX, tileWidth: tileWidth)
             return
         }
@@ -760,19 +979,27 @@ final class LauncherStore: ObservableObject {
     /// dropped onto a folder merges it in; otherwise it is inserted into the
     /// root entries next to the target.
     private func completeFolderDrag(on target: LauncherEntry, locationX: CGFloat?, tileWidth: CGFloat) {
-        guard let folderID = draggedFolderID, let application = draggedFolderApplication else {
+        guard draggedEntryID != nil else {
             endDrag()
             return
         }
         // Dropping back onto the folder it came from is a no-op.
-        if target.id == "folder:\(folderID.uuidString)" {
+        if case .folder(let folder) = target, folder.id == draggedSourceFolderID {
             endDrag()
             return
         }
+        openFolderID = nil
         if folderCandidateID == target.id {
-            moveApplication(application, fromFolder: folderID, onto: target)
+            guard let application = removeDraggedSource() else {
+                endDrag()
+                return
+            }
+            mergeApplication(application, onto: target)
         } else {
-            remove(application: application, fromFolder: folderID, promoteSingleton: false)
+            guard let application = removeDraggedSource() else {
+                endDrag()
+                return
+            }
             let placeAfter = locationX.map { $0 > tileWidth / 2 } ?? false
             if let targetIndex = entries.firstIndex(where: { $0.id == target.id }) {
                 let insertIndex = min(entries.count, targetIndex + (placeAfter ? 1 : 0))
@@ -783,17 +1010,19 @@ final class LauncherStore: ObservableObject {
             normalizeFolders()
             save()
         }
+        dragStartEntries = nil
         endDrag()
     }
 
     /// Drop on blank space: pull the app out of its folder onto the root grid.
     func dropDraggedFolderAppToRoot() {
-        guard let folderID = draggedFolderID, let application = draggedFolderApplication else {
+        guard let application = removeDraggedSource() else {
             endDrag()
             return
         }
-        remove(application: application, fromFolder: folderID, promoteSingleton: false)
+        openFolderID = nil
         entries.append(.application(application))
+        dragStartEntries = nil
         normalizeFolders()
         save()
         endDrag()
@@ -840,11 +1069,17 @@ final class LauncherStore: ObservableObject {
         dragIsCentered = false
     }
 
-    func endDrag(saveLayout: Bool = false) {
+    func endDrag(saveLayout: Bool = false, revertPreview: Bool = false) {
         dragWatchdog?.invalidate(); dragWatchdog = nil
+        // 拖拽取消时把实时让位预览还原，图标回到拖拽前的位置。
+        if revertPreview, let dragStartEntries {
+            entries = dragStartEntries
+        }
+        dragStartEntries = nil
         draggedEntryID = nil
-        draggedFolderID = nil
+        draggedSourceFolderID = nil
         draggedFolderApplication = nil
+        folderDragIsActive = false
         dragTargetID = nil
         folderCandidateID = nil
         dragHoverStartedAt = .distantPast
