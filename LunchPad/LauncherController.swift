@@ -498,6 +498,9 @@ final class LauncherController: ObservableObject {
         // only add work to this callback.
         let eventMask = CGEventMask(1 << CGEventType.keyDown.rawValue)
             | CGEventMask(1 << CGEventType.mouseMoved.rawValue)
+            | CGEventMask(1 << CGEventType.leftMouseDragged.rawValue)
+            | CGEventMask(1 << CGEventType.rightMouseDragged.rawValue)
+            | CGEventMask(1 << CGEventType.otherMouseDragged.rawValue)
             | CGEventMask(1 << 14) // NX_SYSDEFINED
             | CGEventMask(1 << 18) // rotate
             | CGEventMask(1 << 19) // beginGesture
@@ -531,7 +534,11 @@ final class LauncherController: ObservableObject {
                     if RawTrackpadGestureMonitor.hasFourFingerContact { return nil }
                 }
                 // 拖拽期间把指针拉回启动台所在显示器：图标无法被拖到其他显示器。
-                if type == .mouseMoved, let clamped = c.clampDragPointer(event.location) {
+                // 拖拽时鼠标移动以 leftMouseDragged 形式上报，因此一并处理。
+                if (type == .mouseMoved || type == .leftMouseDragged
+                    || type == .rightMouseDragged || type == .otherMouseDragged),
+                   let clamped = c.clampDragPointer(event.location)
+                {
                     CGWarpMouseCursorPosition(clamped)
                 }
                 // Preemptive beginGesture block with timeout release.

@@ -696,9 +696,12 @@ final class LauncherStore: ObservableObject {
                       !self.folderDragIsInsidePanel()
                 else { return }
                 // 拖拽刚打开的文件夹给 1.5 秒宽限期，让指针有时间进入面板；
-                // 之后的移动会重新调度关闭检查。
+                // 宽限期未过时重新调度，保证即使指针停住不动也会在宽限期后关闭。
                 if let openedAt = self.folderOpenedByDragAt,
-                   Date().timeIntervalSince(openedAt) < 1.5 { return }
+                   Date().timeIntervalSince(openedAt) < 1.5 {
+                    self.scheduleFolderAutoClose(delay: 0.5)
+                    return
+                }
                 self.folderOpenedByDragAt = nil
                 self.openFolderID = nil
             }
