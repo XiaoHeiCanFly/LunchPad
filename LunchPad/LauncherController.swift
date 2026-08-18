@@ -70,6 +70,10 @@ final class LauncherController: ObservableObject {
     private let _isPresentedOnScreen = AtomicBool()
     nonisolated var isPresentedOnScreen: Bool { _isPresentedOnScreen.value }
 
+    /// 拖拽指针约束（见 DragConstraintBox）：拖拽期间指针不允许
+    /// 离开启动台所在显示器。
+    nonisolated static let dragConstraint = DragConstraintBox()
+
     private func setPresented(_ value: Bool) {
         isPresented = value
         _isPresentedOnScreen.set(value)
@@ -162,6 +166,7 @@ final class LauncherController: ObservableObject {
         if let m = globalModifierMonitor { NSEvent.removeMonitor(m) }
         DockHoverObserver.shared.stop()
         DockPreviewPanel.shared.hideWindow()
+        Self.dragConstraint.setActive(false)
         panels.forEach { $0.contentView = nil; $0.orderOut(nil); $0.close() }
         panels.removeAll()
         uninstallDialogPanel?.contentView = nil; uninstallDialogPanel?.close()
@@ -492,6 +497,7 @@ final class LauncherController: ObservableObject {
         // it and handled by the local event monitor. Blocking them here would
         // only add work to this callback.
         let eventMask = CGEventMask(1 << CGEventType.keyDown.rawValue)
+            | CGEventMask(1 << CGEventType.mouseMoved.rawValue)
             | CGEventMask(1 << 14) // NX_SYSDEFINED
             | CGEventMask(1 << 18) // rotate
             | CGEventMask(1 << 19) // beginGesture
@@ -523,6 +529,10 @@ final class LauncherController: ObservableObject {
                 if [18, 19, 20, 29, 30, 31].contains(type.rawValue) {
                     if c.isPresentedOnScreen { return nil }
                     if RawTrackpadGestureMonitor.hasFourFingerContact { return nil }
+                }
+                // 拖拽期间把指针拉回启动台所在显示器：图标无法被拖到其他显示器。
+                if type == .mouseMoved, let clamped = c.clampDragPointer(event.location) {
+                    CGWarpMouseCursorPosition(clamped)
                 }
                 // Preemptive beginGesture block with timeout release.
                 if type.rawValue == 19 {
@@ -676,6 +686,16 @@ final class LauncherController: ObservableObject {
 
     // MARK: - Helpers
 
+    /// 拖拽约束：指针越出启动台所在显示器时返回应拉回的位置。
+    nonisolated private func clampDragPointer(_ location: CGPoint) -> CGPoint? {
+        let (frame, active) = Self.dragConstraint.get()
+        guard active, !frame.isEmpty, !frame.contains(location) else { return nil }
+        return CGPoint(
+            x: min(max(location.x, frame.minX), frame.maxX),
+            y: min(max(location.y, frame.minY), frame.maxY)
+        )
+    }
+
     /// Reads only thread-safe state (UserDefaults + CGEvent fields), so the
     /// CGEvent tap can call it on its own thread without a main-thread hop.
     nonisolated private func matchesConfiguredShortcut(_ event: CGEvent) -> Bool {
@@ -725,6 +745,8 @@ final class LauncherController: ObservableObject {
         refreshDisplayOptions()
         guard let screen = presentationScreen() else { panels = []; panelDisplayID = nil; return }
         panelDisplayID = displayID(for: screen)
+        // 拖拽指针约束到该显示器（CG 坐标：左上原点）。
+        Self.dragConstraint.setFrame(screen.cgFrame)
         let dockL = max(0, screen.visibleFrame.minX - screen.frame.minX)
         let dockR = max(0, screen.frame.maxX - screen.visibleFrame.maxX)
         let dockB = max(0, screen.visibleFrame.minY - screen.frame.minY)
@@ -958,6 +980,18 @@ final class LauncherController: ObservableObject {
 }
 
 // MARK: - Thread-safe atomic helpers
+
+/// 拖拽期间把指针约束在启动台所在显示器内的线程安全状态：
+/// tap 线程读取，主线程写入。
+final class DragConstraintBox: @unchecked Sendable {
+    private let lock = NSLock()
+    nonisolated(unsafe) private var frame = CGRect.zero
+    nonisolated(unsafe) private var active = false
+    nonisolated init() {}
+    nonisolated func setFrame(_ frame: CGRect) { lock.lock(); self.frame = frame; lock.unlock() }
+    nonisolated func setActive(_ active: Bool) { lock.lock(); self.active = active; lock.unlock() }
+    nonisolated func get() -> (frame: CGRect, active: Bool) { lock.lock(); defer { lock.unlock() }; return (frame, active) }
+}
 
 private final class AtomicBool: @unchecked Sendable {
     nonisolated private let lock = NSLock()

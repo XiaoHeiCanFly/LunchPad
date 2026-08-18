@@ -652,6 +652,7 @@ final class LauncherStore: ObservableObject {
     }
 
     func beginDrag(_ entry: LauncherEntry) {
+        LauncherController.dragConstraint.setActive(true)
         draggedEntryID = entry.id
         draggedSourceFolderID = nil
         draggedFolderApplication = nil
@@ -667,6 +668,7 @@ final class LauncherStore: ObservableObject {
     /// Starts a drag that carries an application out of a folder. The source
     /// lives inside a folder entry, so the drop path differs from root drags.
     func beginFolderDrag(_ application: LauncherApplication, folderID: UUID) {
+        LauncherController.dragConstraint.setActive(true)
         draggedEntryID = application.id
         draggedSourceFolderID = folderID
         draggedFolderApplication = application
@@ -718,7 +720,7 @@ final class LauncherStore: ObservableObject {
         if folderDragIsInsidePanel() {
             pendingFolderAutoClose?.cancel()
         } else {
-            scheduleFolderAutoClose(delay: 0.3)
+            scheduleFolderAutoClose(delay: 1.0)
         }
     }
 
@@ -1190,6 +1192,7 @@ final class LauncherStore: ObservableObject {
 
     func endDrag(saveLayout: Bool = false, revertPreview: Bool = false) {
         dragWatchdog?.invalidate(); dragWatchdog = nil
+        LauncherController.dragConstraint.setActive(false)
         pendingFolderAutoClose?.cancel()
         pendingFolderAutoClose = nil
         folderOpenedByDragAt = nil
