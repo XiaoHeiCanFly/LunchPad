@@ -115,6 +115,9 @@ final class LauncherStore: ObservableObject {
     /// 拖拽刚自动打开文件夹的时间；宽限期内不自动关闭，
     /// 给指针时间进入面板。
     private var folderOpenedByDragAt: Date?
+    /// 本次拖拽会话中已经自动打开过的文件夹；防止自动打开→关闭→
+    /// 又自动打开的闪烁循环（指针移开后再次悬停才重新触发）。
+    private var autoOpenedFolderID: UUID?
     private var pendingFolderAutoClose: DispatchWorkItem?
     private var lastFolderPreviewReorderAt = Date.distantPast
     @Published var aliasDraft = ""
@@ -779,6 +782,8 @@ final class LauncherStore: ObservableObject {
 
         if dragTargetID != target.id {
             dragTargetID = target.id
+            // 新目标：允许再次自动打开文件夹（移开后重新悬停可重触发）。
+            autoOpenedFolderID = nil
             folderCandidateID = targetIsFolder ? target.id : nil
             dragHoverStartedAt = Date()
             if !targetIsFolder {
@@ -801,6 +806,7 @@ final class LauncherStore: ObservableObject {
                         self.folderCandidateID = nil
                         self.openFolderID = folderID
                         self.folderOpenedByDragAt = Date()
+                        self.autoOpenedFolderID = folderID
                     }
                 }
             }
@@ -819,11 +825,13 @@ final class LauncherStore: ObservableObject {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                     guard let self, self.draggedEntryID != nil,
                           self.dragTargetID == "folder:\(folderID.uuidString)",
-                          self.openFolderID != folderID
+                          self.openFolderID != folderID,
+                          self.autoOpenedFolderID != folderID
                     else { return }
                     if let mergedFolderID = self.mergeDraggedIntoFolder(folderID) {
                         self.openFolderID = mergedFolderID
                         self.folderOpenedByDragAt = Date()
+                        self.autoOpenedFolderID = mergedFolderID
                     }
                 }
             }
@@ -1185,6 +1193,7 @@ final class LauncherStore: ObservableObject {
         pendingFolderAutoClose?.cancel()
         pendingFolderAutoClose = nil
         folderOpenedByDragAt = nil
+        autoOpenedFolderID = nil
         // 拖拽取消时把实时让位预览还原，图标回到拖拽前的位置。
         if revertPreview, let dragStartEntries {
             entries = dragStartEntries
