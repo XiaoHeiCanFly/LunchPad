@@ -109,6 +109,13 @@ final class LauncherStore: ObservableObject {
     private var dragStartEntries: [LauncherEntry]?
     /// 拖拽是否正悬停在某个文件夹的磁贴上（用于“拖出文件夹自动关闭”）。
     private var folderDragIsActive = false
+    /// 当前打开的文件夹浮层的面板区域（屏幕坐标，与 NSEvent.mouseLocation 一致）。
+    /// 指针在面板内时文件夹保持打开；离开面板才会自动关闭。
+    var folderPanelRect: CGRect?
+    /// 拖拽刚自动打开文件夹的时间；宽限期内不自动关闭，
+    /// 给指针时间进入面板。
+    private var folderOpenedByDragAt: Date?
+    private var pendingFolderAutoClose: DispatchWorkItem?
     private var lastFolderPreviewReorderAt = Date.distantPast
     @Published var aliasDraft = ""
     @Published private(set) var runtimeGridColumns = 0
@@ -667,20 +674,63 @@ final class LauncherStore: ObservableObject {
         dragHoverStartedAt = .distantPast
         dragBeganAt = Date()
         startDragWatchdog()
-        // 拖出文件夹：一旦拖拽没有落在文件夹磁贴上，自动关闭文件夹浮层，
+        // 拖出文件夹：指针一旦离开文件夹面板区域，自动关闭文件夹浮层，
         // 露出根网格方便确定落点。仍在文件夹内排序时保持打开。
-        scheduleFolderCloseIfAbandoned(folderID: folderID, delay: 0.25)
+        scheduleFolderAutoClose(delay: 0.25)
     }
 
-    /// 拖拽期间自动打开的文件夹，若指针迟迟没有进入文件夹磁贴区域
-    /// （用户实际在往外拖），自动关闭，避免浮层挡住根网格。
-    private func scheduleFolderCloseIfAbandoned(folderID: UUID, delay: TimeInterval) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self, self.draggedEntryID != nil,
-                  self.openFolderID == folderID, !self.folderDragIsActive
-            else { return }
-            self.openFolderID = nil
+    /// 响应式自动关闭：指针在打开中的文件夹面板内则保持打开（取消计时），
+    /// 离开面板（且不在任何文件夹磁贴上）则延迟后关闭。
+    private func scheduleFolderAutoClose(delay: TimeInterval) {
+        pendingFolderAutoClose?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.draggedEntryID != nil,
+                      self.draggedSourceFolderID != nil,
+                      !self.folderDragIsActive,
+                      !self.folderDragIsInsidePanel()
+                else { return }
+                // 拖拽刚打开的文件夹给 1.5 秒宽限期，让指针有时间进入面板；
+                // 之后的移动会重新调度关闭检查。
+                if let openedAt = self.folderOpenedByDragAt,
+                   Date().timeIntervalSince(openedAt) < 1.5 { return }
+                self.folderOpenedByDragAt = nil
+                self.openFolderID = nil
+            }
         }
+        pendingFolderAutoClose = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    /// 指针是否在“源所在且已打开”的文件夹面板内（屏幕坐标判定）。
+    private func folderDragIsInsidePanel() -> Bool {
+        guard let rect = folderPanelRect, let openID = openFolderID,
+              draggedSourceFolderID == openID else { return false }
+        return rect.contains(NSEvent.mouseLocation)
+    }
+
+    /// 文件夹浮层空白区域：进入/移动时按面板位置决定保持或关闭。
+    func folderDragHoveringBlank() {
+        folderDragIsActive = false
+        if folderDragIsInsidePanel() {
+            pendingFolderAutoClose?.cancel()
+        } else {
+            scheduleFolderAutoClose(delay: 0.3)
+        }
+    }
+
+    /// 在文件夹浮层空白处松开：面板外关闭文件夹；面板内保持打开。
+    func folderDragDroppedOnBlank() {
+        pendingFolderAutoClose?.cancel()
+        folderDragIsActive = false
+        if !folderDragIsInsidePanel() {
+            openFolderID = nil
+        }
+    }
+
+    /// 文件夹浮层面板区域（屏幕坐标、左下原点，与 NSEvent.mouseLocation 一致）。
+    func updateFolderPanelRect(_ frame: CGRect, screenHeight: CGFloat) {
+        folderPanelRect = CGRect(x: frame.minX, y: screenHeight - frame.maxY, width: frame.width, height: frame.height)
     }
 
     private func startDragWatchdog() {
@@ -705,6 +755,8 @@ final class LauncherStore: ObservableObject {
         // grace period lets the session actually start before we watch.
         let leftButtonHeld = NSEvent.pressedMouseButtons & 1 != 0
         guard !leftButtonHeld, Date().timeIntervalSince(dragBeganAt) > 0.4 else { return }
+        // 拖拽被取消（Esc / 松手在无效区域）：关闭拖拽期间打开的文件夹。
+        openFolderID = nil
         endDrag(revertPreview: true)
     }
 
@@ -748,7 +800,7 @@ final class LauncherStore: ObservableObject {
                     if let folderID = self.autoCreateFolder(on: target) {
                         self.folderCandidateID = nil
                         self.openFolderID = folderID
-                        self.scheduleFolderCloseIfAbandoned(folderID: folderID, delay: 1.2)
+                        self.folderOpenedByDragAt = Date()
                     }
                 }
             }
@@ -760,16 +812,19 @@ final class LauncherStore: ObservableObject {
             // preview reordering here, otherwise a folder at the end of a row is
             // pushed onto the next row just as the pointer enters it.
             folderCandidateID = target.id
-            // 悬停 1.5 秒：自动打开文件夹，允许继续拖入并排序。
+            // 悬停 1 秒：把拖入的应用合并进文件夹并打开，
+            // 之后可在文件夹内继续拖动排序。
             if case .folder(let folder) = target, folder.id != draggedSourceFolderID {
                 let folderID = folder.id
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                     guard let self, self.draggedEntryID != nil,
                           self.dragTargetID == "folder:\(folderID.uuidString)",
                           self.openFolderID != folderID
                     else { return }
-                    self.openFolderID = folderID
-                    self.scheduleFolderCloseIfAbandoned(folderID: folderID, delay: 1.2)
+                    if let mergedFolderID = self.mergeDraggedIntoFolder(folderID) {
+                        self.openFolderID = mergedFolderID
+                        self.folderOpenedByDragAt = Date()
+                    }
                 }
             }
             return
@@ -795,6 +850,7 @@ final class LauncherStore: ObservableObject {
     func updateFolderDrag(over targetApplication: LauncherApplication, folderID: UUID, locationX: CGFloat, tileWidth: CGFloat) {
         guard draggedEntryID != nil, draggedEntryID != targetApplication.id else { return }
         folderDragIsActive = true
+        pendingFolderAutoClose?.cancel()
         dragTargetID = targetApplication.id
         dragHoverStartedAt = Date()
         let centerBand = max(44, tileWidth * 0.46)
@@ -814,7 +870,7 @@ final class LauncherStore: ObservableObject {
         previewFolderReorder(over: targetApplication, folderID: folderID, placeAfter: lastDragPlaceAfter)
     }
 
-    /// 指针离开文件夹磁贴。
+    /// 指针离开文件夹磁贴（可能进入面板空白，由 folderDragHoveringBlank 接管）。
     func folderDragExited() {
         folderDragIsActive = false
         dragTargetID = nil
@@ -941,6 +997,35 @@ final class LauncherStore: ObservableObject {
         }
         normalizeFolders()
         save()
+    }
+
+    /// 把拖拽中的应用合并进现有文件夹（拖拽状态保留，可继续排序）。
+    @discardableResult
+    private func mergeDraggedIntoFolder(_ folderID: UUID) -> UUID? {
+        guard let application = removeDraggedSource() else { return nil }
+        guard let index = entries.firstIndex(where: {
+            if case .folder(let folder) = $0 { return folder.id == folderID }
+            return false
+        }), case .folder(var folder) = entries[index] else {
+            // 目标文件夹已不存在（如被解散）：把应用放回根网格。
+            entries.append(.application(application))
+            normalizeFolders()
+            save()
+            return nil
+        }
+        guard !folder.applications.contains(where: { $0.id == application.id }) else {
+            draggedSourceFolderID = folderID
+            draggedFolderApplication = application
+            return folderID
+        }
+        folder.applications.append(application)
+        entries[index] = .folder(folder)
+        draggedSourceFolderID = folderID
+        draggedFolderApplication = application
+        dragStartEntries = nil
+        normalizeFolders()
+        save()
+        return folderID
     }
 
     /// 悬停 1.5 秒后立即创建文件夹并打开（拖拽状态保留，可继续排序）。
@@ -1097,6 +1182,9 @@ final class LauncherStore: ObservableObject {
 
     func endDrag(saveLayout: Bool = false, revertPreview: Bool = false) {
         dragWatchdog?.invalidate(); dragWatchdog = nil
+        pendingFolderAutoClose?.cancel()
+        pendingFolderAutoClose = nil
+        folderOpenedByDragAt = nil
         // 拖拽取消时把实时让位预览还原，图标回到拖拽前的位置。
         if revertPreview, let dragStartEntries {
             entries = dragStartEntries

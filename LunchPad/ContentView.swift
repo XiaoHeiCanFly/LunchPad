@@ -1254,12 +1254,9 @@ private struct FolderOverlay: View {
                 // root backdrop's `BlankAreaCatcher`.
                 BlankAreaCatcher(onDismiss: { closeFolder() })
                     .frame(width: proxy.size.width, height: proxy.size.height)
-                    // 拖拽中：浮层空白区域吞掉落点，避免穿透到根网格磁贴
-                    // 触发误关闭/误排序；落点由文件夹磁贴自行处理。
-                    .onDrop(of: [UTType.fileURL, UTType.utf8PlainText], isTargeted: nil) { _ in
-                        store.folderDragExited()
-                        return true
-                    }
+                    // 拖拽中：浮层空白区域吞掉落点，避免穿透到根网格磁贴；
+                    // 进入/移动时按面板位置决定保持或自动关闭。
+                    .onDrop(of: [UTType.fileURL, UTType.utf8PlainText], delegate: FolderBlankDropDelegate(store: store))
 
                 VStack(spacing: 30) {
                     TextField("文件夹名称", text: $name)
@@ -1307,6 +1304,18 @@ private struct FolderOverlay: View {
                 .scaleEffect(appeared ? 1 : 0.94)
                 .offset(y: appeared ? -16 : 8)
                 .opacity(appeared ? 1 : 0)
+                // 把面板区域上报给 store：拖拽时据此判断指针是否在文件夹内。
+                .background {
+                    GeometryReader { panelGeo in
+                        Color.clear
+                            .onAppear {
+                                store.updateFolderPanelRect(panelGeo.frame(in: .global), screenHeight: proxy.size.height)
+                            }
+                            .onChange(of: panelGeo.frame(in: .global)) { _, frame in
+                                store.updateFolderPanelRect(frame, screenHeight: proxy.size.height)
+                            }
+                    }
+                }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
@@ -1320,6 +1329,7 @@ private struct FolderOverlay: View {
         .onDisappear {
             store.renameFolder(id: folder.id, name: name)
             store.folderOverlayIsDimmed = false
+            store.folderPanelRect = nil
         }
     }
 
@@ -1417,6 +1427,30 @@ private struct FolderApplicationTile: View {
                 Button("卸载应用", role: .destructive) { store.requestUninstall(application) }
             }
         }
+    }
+}
+
+/// 文件夹浮层空白区域的拖放委托：吞掉落点防止穿透根网格；
+/// 进入/移动时按面板位置决定保持或自动关闭，松开时面板外关闭。
+private struct FolderBlankDropDelegate: DropDelegate {
+    let store: LauncherStore
+
+    func dropEntered(info: DropInfo) {
+        store.folderDragHoveringBlank()
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        store.folderDragHoveringBlank()
+        return DropProposal(operation: .move)
+    }
+
+    func dropExited(info: DropInfo) {
+        store.folderDragExited()
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        store.folderDragDroppedOnBlank()
+        return true
     }
 }
 
