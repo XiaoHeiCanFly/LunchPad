@@ -1271,9 +1271,6 @@ final class LauncherStore: ObservableObject {
         var roots = ["/Applications", "/System/Applications"]
         let userApplications = fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Applications").path
         if fileManager.fileExists(atPath: userApplications) { roots.append(userApplications) }
-        // Launch Services 未注册的 .app 在启动台、聚焦和访达的智能视图中
-        // 都不显示；注册表查询失败时返回 nil，表示不过滤。
-        let registeredPaths = registeredApplicationPaths()
         var results: [String: LauncherApplication] = [:]
 
         for root in roots {
@@ -1287,13 +1284,14 @@ final class LauncherStore: ObservableObject {
                 guard url.pathExtension.caseInsensitiveCompare("app") == .orderedSame else { continue }
                 enumerator.skipDescendants()
                 guard let bundle = Bundle(url: url) else { continue }
-                // macOS 的启动台/聚焦不显示纯菜单栏应用（LSUIElement）和
-                // 后台代理应用（LSBackgroundOnly），LunchPad 保持一致。
+                // macOS 的启动台不显示纯菜单栏应用（LSUIElement）和后台代理
+                // 应用（LSBackgroundOnly），LunchPad 保持一致。注意：不做
+                // Launch Services 注册检查——未注册/当前系统不支持的应用
+                // （如仅支持到 macOS 26 的 Xcode）仍然展示。
                 let lsuiElement = (bundle.object(forInfoDictionaryKey: "LSUIElement") as? NSNumber)?.boolValue ?? false
                 let lsBackgroundOnly = (bundle.object(forInfoDictionaryKey: "LSBackgroundOnly") as? NSNumber)?.boolValue ?? false
                 if lsuiElement || lsBackgroundOnly { continue }
                 let standardizedPath = url.resolvingSymlinksInPath().standardizedFileURL.path
-                if let registeredPaths, !registeredPaths.contains(standardizedPath) { continue }
                 let displayName = (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
                     ?? (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String)
                     ?? url.deletingPathExtension().lastPathComponent
@@ -1308,19 +1306,6 @@ final class LauncherStore: ObservableObject {
         }
 
         return results.values.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-    }
-
-    /// All bundle paths the system has registered with Launch Services,
-    /// resolved to their real (symlink-free) standardized paths.
-    nonisolated private static func registeredApplicationPaths() -> Set<String>? {
-        guard let cls = NSClassFromString("LSApplicationWorkspace") as? NSObject.Type,
-              let workspace = cls.perform(NSSelectorFromString("defaultWorkspace"))?.takeUnretainedValue(),
-              let apps = workspace.perform(NSSelectorFromString("allApplications"))?.takeUnretainedValue() as? [AnyObject]
-        else { return nil }
-        return Set(apps.compactMap { app -> String? in
-            guard let url = app.perform(NSSelectorFromString("bundleURL"))?.takeUnretainedValue() as? URL else { return nil }
-            return url.resolvingSymlinksInPath().standardizedFileURL.path
-        })
     }
 }
 
