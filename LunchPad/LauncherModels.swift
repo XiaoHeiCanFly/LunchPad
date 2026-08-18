@@ -710,11 +710,15 @@ final class LauncherStore: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    /// 指针是否在“源所在且已打开”的文件夹面板内（屏幕坐标判定）。
+    /// 指针是否在“源所在且已打开”的文件夹面板内。
+    /// 矩形与鼠标都换算到 CG 全局坐标（左上原点、主屏基准）比较。
     private func folderDragIsInsidePanel() -> Bool {
         guard let rect = folderPanelRect, let openID = openFolderID,
-              draggedSourceFolderID == openID else { return false }
-        return rect.contains(NSEvent.mouseLocation)
+              draggedSourceFolderID == openID,
+              let primaryHeight = NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.height
+        else { return false }
+        let mouse = NSEvent.mouseLocation
+        return rect.contains(CGPoint(x: mouse.x, y: primaryHeight - mouse.y))
     }
 
     /// 文件夹浮层空白区域：进入/移动时按面板位置决定保持或关闭。
@@ -736,9 +740,22 @@ final class LauncherStore: ObservableObject {
         }
     }
 
-    /// 文件夹浮层面板区域（屏幕坐标、左下原点，与 NSEvent.mouseLocation 一致）。
-    func updateFolderPanelRect(_ frame: CGRect, screenHeight: CGFloat) {
-        folderPanelRect = CGRect(x: frame.minX, y: screenHeight - frame.maxY, width: frame.width, height: frame.height)
+    /// 文件夹浮层面板区域（CG 全局坐标，左上原点、主屏基准）。
+    /// 用启动台窗口的 AppKit frame 换算，任意显示器位置都精确。
+    func updateFolderPanelRect(_ frame: CGRect) {
+        guard let windowFrame = LauncherController.shared.presentedWindowFrame,
+              let primaryHeight = NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.height
+        else {
+            folderPanelRect = nil
+            return
+        }
+        let windowTopLeftCG = CGPoint(x: windowFrame.minX, y: primaryHeight - windowFrame.maxY)
+        folderPanelRect = CGRect(
+            x: windowTopLeftCG.x + frame.minX,
+            y: windowTopLeftCG.y + frame.minY,
+            width: frame.width,
+            height: frame.height
+        )
     }
 
     private func startDragWatchdog() {

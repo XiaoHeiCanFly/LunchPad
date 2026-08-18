@@ -1309,10 +1309,10 @@ private struct FolderOverlay: View {
                     GeometryReader { panelGeo in
                         Color.clear
                             .onAppear {
-                                store.updateFolderPanelRect(panelGeo.frame(in: .global), screenHeight: proxy.size.height)
+                                store.updateFolderPanelRect(panelGeo.frame(in: .global))
                             }
                             .onChange(of: panelGeo.frame(in: .global)) { _, frame in
-                                store.updateFolderPanelRect(frame, screenHeight: proxy.size.height)
+                                store.updateFolderPanelRect(frame)
                             }
                     }
                 }

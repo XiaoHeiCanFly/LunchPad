@@ -74,6 +74,10 @@ final class LauncherController: ObservableObject {
     /// 离开启动台所在显示器。
     nonisolated static let dragConstraint = DragConstraintBox()
 
+    /// 启动台窗口的 AppKit frame（左下原点屏幕坐标），供文件夹面板
+    /// 区域换算使用。
+    var presentedWindowFrame: NSRect? { panels.first?.frame }
+
     private func setPresented(_ value: Bool) {
         isPresented = value
         _isPresentedOnScreen.set(value)
