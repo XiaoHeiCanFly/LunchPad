@@ -503,6 +503,7 @@ final class LauncherController: ObservableObject {
         let eventMask = CGEventMask(1 << CGEventType.keyDown.rawValue)
             | CGEventMask(1 << CGEventType.mouseMoved.rawValue)
             | CGEventMask(1 << CGEventType.leftMouseDragged.rawValue)
+            | CGEventMask(1 << CGEventType.leftMouseUp.rawValue)
             | CGEventMask(1 << CGEventType.rightMouseDragged.rawValue)
             | CGEventMask(1 << CGEventType.otherMouseDragged.rawValue)
             | CGEventMask(1 << 14) // NX_SYSDEFINED
@@ -544,6 +545,18 @@ final class LauncherController: ObservableObject {
                    let clamped = c.clampDragPointer(event.location)
                 {
                     CGWarpMouseCursorPosition(clamped)
+                }
+                // A drop outside every SwiftUI destination has no
+                // `performDrop` callback. Observe the session's real mouse-up
+                // and clear any surviving drag state after AppKit has had a
+                // chance to deliver a valid destination drop on the main run
+                // loop. This prevents the launcher remaining stuck in drag UI.
+                if type == .leftMouseUp {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                        MainActor.assumeIsolated {
+                            c.store.finishAbandonedDragIfNeeded()
+                        }
+                    }
                 }
                 // Preemptive beginGesture block with timeout release.
                 if type.rawValue == 19 {
@@ -1011,6 +1024,112 @@ private final class AtomicBool: @unchecked Sendable {
     nonisolated init() {}
     nonisolated var value: Bool { lock.lock(); defer { lock.unlock() }; return _value }
     nonisolated func set(_ v: Bool) { lock.lock(); _value = v; lock.unlock() }
+}
+
+// MARK: - Drag icon compositor
+
+/// Owns the visible drag icon independently from SwiftUI's NSDraggingSession.
+/// The native dragging image is deliberately transparent, which lets this
+/// panel switch from pointer-following to the return animation in the same
+/// frame instead of waiting for AppKit's dragging-image fade to finish.
+@MainActor
+final class DragIconWindowController {
+    static let shared = DragIconWindowController()
+
+    private let panel: NSPanel
+    private let imageView = NSImageView()
+    private var trackingTimer: Timer?
+    private var iconSize: CGFloat = 0
+
+    private init() {
+        panel = NSPanel(
+            contentRect: .zero,
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.draggingWindow)))
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.ignoresMouseEvents = true
+        panel.hidesOnDeactivate = false
+        panel.isReleasedWhenClosed = false
+        panel.animationBehavior = .none
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+
+        imageView.imageAlignment = .alignCenter
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        imageView.wantsLayer = true
+        imageView.layer?.masksToBounds = false
+        panel.contentView = imageView
+    }
+
+    func begin(path: String, size: CGFloat) {
+        stopTracking()
+        panel.orderOut(nil)
+        iconSize = size
+        imageView.image = NSWorkspace.shared.icon(forFile: path)
+        imageView.alphaValue = 1
+        panel.alphaValue = 1
+        positionAtPointer()
+        panel.orderFrontRegardless()
+
+        let timer = Timer(timeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.positionAtPointer() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        trackingTimer = timer
+    }
+
+    /// `destination` uses the launcher's top-left CG coordinate system.
+    func returnTo(destination: CGRect, targetSize: CGFloat) {
+        guard panel.isVisible else { return }
+        stopTracking()
+        guard let primaryHeight = NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.height else {
+            hide()
+            return
+        }
+        let size = max(1, targetSize)
+        let targetFrame = NSRect(
+            x: destination.midX - size / 2,
+            y: primaryHeight - destination.midY - size / 2,
+            width: size,
+            height: size
+        )
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.24
+            context.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 0.78, 0.22, 1)
+            panel.animator().setFrame(targetFrame, display: true)
+        } completionHandler: { [weak self] in
+            Task { @MainActor [weak self] in self?.hide() }
+        }
+    }
+
+    func hide() {
+        stopTracking()
+        panel.orderOut(nil)
+        imageView.image = nil
+    }
+
+    private func positionAtPointer() {
+        guard panel.isVisible || imageView.image != nil else { return }
+        let mouse = NSEvent.mouseLocation
+        panel.setFrame(
+            NSRect(
+                x: mouse.x - iconSize / 2,
+                y: mouse.y - iconSize / 2,
+                width: iconSize,
+                height: iconSize
+            ),
+            display: true
+        )
+    }
+
+    private func stopTracking() {
+        trackingTimer?.invalidate()
+        trackingTimer = nil
+    }
 }
 
 // MARK: - Panel classes

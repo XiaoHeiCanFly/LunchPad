@@ -163,10 +163,10 @@ private struct PagesGrid: View {
                         .onTapGesture { controller.hide() }
                         // Dropping an app dragged out of a folder onto blank
                         // space places it at the end of the root grid.
-                        .onDrop(of: [UTType.fileURL, UTType.utf8PlainText], isTargeted: nil) { _ in
-                            store.dropDraggedFolderAppToRoot()
-                            return true
-                        }
+                        .onDrop(
+                            of: [UTType.fileURL, UTType.utf8PlainText],
+                            delegate: RootBlankDropDelegate(store: store)
+                        )
 
                     if abs(pageIndex - store.currentPage) <= 1 {
                         LazyVGrid(columns: metrics.gridItems, spacing: 6) {
@@ -181,7 +181,10 @@ private struct PagesGrid: View {
                                     isDragTarget: store.dragTargetID == entry.id && store.draggedEntryID != entry.id,
                                     isFolderCandidate: store.folderCandidateID == entry.id && store.draggedEntryID != entry.id,
                                     isSelected: store.selectedEntryID == entry.id,
-                                    optionIsPressed: store.optionIsPressed
+                                    optionIsPressed: store.optionIsPressed,
+                                    dragHoverProgress: store.draggedEntryID == entry.id
+                                        ? store.folderHoverProgress
+                                        : 0
                                 )
                                 .equatable()
                             }
@@ -378,7 +381,7 @@ struct ContentView: View {
                 x: contentRect.midX,
                 y: screenSize.height - contentRect.midY
             )
-            .opacity(store.openFolderID == nil ? 1 : 0.08)
+            .opacity(store.openFolderID == nil ? 1 : 0)
             .scaleEffect(store.openFolderID == nil ? 1 : 0.96)
             .blur(radius: store.openFolderID == nil ? 0 : 8)
             .animation(.spring(response: 0.36, dampingFraction: 0.86), value: store.openFolderID)
@@ -386,12 +389,15 @@ struct ContentView: View {
             if let folderID = store.openFolderID, let folder = store.folder(id: folderID) {
                 FolderOverlay(folder: folder)
                     .transition(.scale(scale: 0.94, anchor: .center).combined(with: .opacity))
-                    .frame(width: contentSize.width, height: contentSize.height)
+                    // 全屏：遮罩与拖放事件区域必须覆盖到屏幕底（含 Dock 区域），
+                    // 否则拖到框下方的 Dock 条时收不到事件、文件夹无法关闭。
+                    .frame(width: screenSize.width, height: screenSize.height)
                     .position(
-                        x: contentRect.midX,
-                        y: screenSize.height - contentRect.midY
+                        x: screenSize.width / 2,
+                        y: screenSize.height / 2
                     )
             }
+
         }
         .frame(width: screenSize.width, height: screenSize.height)
         // Backdrop + content opacity/scale are driven by the panel's layer
@@ -931,6 +937,7 @@ private struct LauncherTile: View, Equatable {
     let isFolderCandidate: Bool
     let isSelected: Bool
     let optionIsPressed: Bool
+    let dragHoverProgress: CGFloat
 
     static func == (lhs: LauncherTile, rhs: LauncherTile) -> Bool {
         lhs.entry == rhs.entry
@@ -943,6 +950,7 @@ private struct LauncherTile: View, Equatable {
             && lhs.isFolderCandidate == rhs.isFolderCandidate
             && lhs.isSelected == rhs.isSelected
             && lhs.optionIsPressed == rhs.optionIsPressed
+            && lhs.dragHoverProgress == rhs.dragHoverProgress
     }
 
     private var iconScale: CGFloat {
@@ -954,6 +962,21 @@ private struct LauncherTile: View, Equatable {
             ZStack(alignment: .topLeading) {
                 icon
                     .frame(width: iconSize, height: iconSize)
+                    .background {
+                        GeometryReader { iconGeometry in
+                            Color.clear
+                                .onAppear {
+                                    store.updateRootApplicationRect(
+                                        entryID: entry.id,
+                                        frame: iconGeometry.frame(in: .global)
+                                    )
+                                }
+                                .onChange(of: iconGeometry.frame(in: .global)) { _, frame in
+                                    store.updateRootApplicationRect(entryID: entry.id, frame: frame)
+                                }
+                                .onDisappear { store.removeRootApplicationRect(entryID: entry.id) }
+                        }
+                    }
                     .contentShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
                     .onTapGesture(perform: activate)
                     .scaleEffect(iconScale)
@@ -1010,7 +1033,10 @@ private struct LauncherTile: View, Equatable {
         .frame(maxWidth: .infinity)
         .padding(.vertical, 6)
         .scaleEffect(isDragged ? 0.88 : 1)
-        .opacity(isDragged ? 0.24 : 1)
+        // The placeholder fade is also the spring-load clock. When it reaches
+        // zero, the store consumes this slot and opens the hovered folder in
+        // the animation completion callback.
+        .opacity(isDragged ? 0.24 * (1 - dragHoverProgress) : 1)
         .animation(.spring(response: 0.30, dampingFraction: 0.74), value: isDragged)
         .zIndex(isDragTarget ? 2 : (isDragged ? 1 : 0))
         .transition(.scale(scale: 0.78).combined(with: .opacity))
@@ -1019,14 +1045,12 @@ private struct LauncherTile: View, Equatable {
                 store.beginDrag(entry)
             }
             if let application = store.application(in: entry) {
+                DragIconWindowController.shared.begin(path: application.path, size: iconSize)
                 return NSItemProvider(object: application.url as NSURL)
             }
             return NSItemProvider(object: entry.id as NSString)
         } preview: {
-            dragPreview
-                .padding(12)
-                .background(.black.opacity(0.10), in: RoundedRectangle(cornerRadius: iconSize * 0.30, style: .continuous))
-                .shadow(color: .black.opacity(0.34), radius: 18, y: 12)
+            nativeDragPreview
         }
         .onDrop(
             of: [UTType.fileURL, UTType.utf8PlainText],
@@ -1067,6 +1091,16 @@ private struct LauncherTile: View, Equatable {
         case .folder(let folder):
             FolderIcon(folder: folder, size: iconSize * 0.92)
                 .frame(width: iconSize, height: iconSize)
+        }
+    }
+
+    @ViewBuilder
+    private var nativeDragPreview: some View {
+        switch entry {
+        case .application:
+            Color.clear.frame(width: 1, height: 1)
+        case .folder:
+            dragPreview
         }
     }
 
@@ -1230,9 +1264,18 @@ private struct FolderOverlay: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let folder: LauncherFolder
     @State private var name: String = ""
-    @State private var appeared = false
+    /// A spring-loaded folder is inserted while AppKit owns a dragging run loop.
+    /// Waiting for `onAppear` to flip this from false can leave the root hidden
+    /// and the overlay transparent until the pointer moves again. The parent
+    /// transition already supplies the opening animation, so the first frame
+    /// must be renderable immediately.
+    @State private var appeared = true
 
     var body: some View {
+        // Do not keep rendering the value captured when the overlay opened.
+        // Folder reorders mutate the folder inside `store.entries`; resolving
+        // it here makes every drag callback and grid pass use that live order.
+        let liveFolder = store.folder(id: folder.id) ?? folder
         GeometryReader { proxy in
             let panelWidth = max(360, min(proxy.size.width - 40, proxy.size.width * 0.88))
             let horizontalPadding = min(72, max(24, panelWidth * 0.045))
@@ -1241,15 +1284,12 @@ private struct FolderOverlay: View {
             let columnCount = max(3, min(7, Int((availableWidth + horizontalSpacing) / 145)))
             let cellWidth = (availableWidth - CGFloat(columnCount - 1) * horizontalSpacing) / CGFloat(columnCount)
             let folderIconSize = min(110, max(58, cellWidth * 0.62))
-            let rowCount = max(1, Int(ceil(Double(folder.applications.count) / Double(columnCount))))
+            let rowCount = max(1, Int(ceil(Double(liveFolder.applications.count) / Double(columnCount))))
             let requiredHeight = CGFloat(rowCount) * (folderIconSize + 40)
                 + CGFloat(max(0, rowCount - 1)) * 24 + 64
             let panelHeight = min(max(190, requiredHeight), proxy.size.height * 0.56)
 
             ZStack {
-                Color.black.opacity(appeared ? 0.24 : 0)
-                    .ignoresSafeArea()
-
                 // First-click dismiss of the folder, same rationale as the
                 // root backdrop's `BlankAreaCatcher`.
                 BlankAreaCatcher(onDismiss: { closeFolder() })
@@ -1279,19 +1319,42 @@ private struct FolderOverlay: View {
                             ),
                             spacing: 24
                         ) {
-                            ForEach(folder.applications) { application in
+                            ForEach(liveFolder.applications) { application in
                                 FolderApplicationTile(
                                     application: application,
                                     folderID: folder.id,
                                     iconSize: folderIconSize,
-                                    tileWidth: cellWidth
+                                    tileWidth: cellWidth,
+                                    store: store,
+                                    controller: controller,
+                                    optionIsPressed: store.optionIsPressed,
+                                    isDragged: store.draggedEntryID == application.id
+                                        && store.draggedSourceFolderID == folder.id,
+                                    isFolderDropTarget: store.draggedEntryID != nil
+                                        && store.draggedEntryID != application.id
+                                        && store.dragTargetID == application.id
                                 )
+                                .equatable()
                             }
                         }
-                        .animation(reduceMotion ? nil : .spring(response: 0.36, dampingFraction: 0.82, blendDuration: 0.12), value: folder.applications)
+                        // During an active drag use a short, non-bouncy move.
+                        // Repeated springs accumulate velocity and are the main
+                        // source of lag when rapidly crossing several slots.
+                        .animation(
+                            reduceMotion
+                                ? nil
+                                : (store.draggedEntryID == nil
+                                    ? .spring(response: 0.36, dampingFraction: 0.82, blendDuration: 0.12)
+                                    : .easeOut(duration: 0.12)),
+                            value: liveFolder.applications.map(\.id)
+                        )
                         .padding(.horizontal, horizontalPadding)
                         .padding(.vertical, 32)
                     }
+                    // Once an icon drag has begun the scroll view must not
+                    // compete for the same pointer stream. It otherwise wins
+                    // intermittently and folder DropDelegates stop updating.
+                    .scrollDisabled(store.draggedEntryID != nil)
                     .frame(width: panelWidth, height: panelHeight)
                     .background(.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 38, style: .continuous))
                     .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 38, style: .continuous))
@@ -1300,22 +1363,23 @@ private struct FolderOverlay: View {
                             .stroke(.white.opacity(0.13), lineWidth: 1)
                     }
                     .shadow(color: .black.opacity(0.20), radius: 42, y: 22)
+                    // “框”的几何（标题下方的网格面板）上报给 store：
+                    // 拖出这个框就算离开文件夹（标题与间隙都算框外）。
+                    .background {
+                        GeometryReader { boxGeo in
+                            Color.clear
+                                .onAppear {
+                                    store.updateFolderPanelRect(boxGeo.frame(in: .global))
+                                }
+                                .onChange(of: boxGeo.frame(in: .global)) { _, frame in
+                                    store.updateFolderPanelRect(frame)
+                                }
+                        }
+                    }
                 }
                 .scaleEffect(appeared ? 1 : 0.94)
                 .offset(y: appeared ? -16 : 8)
                 .opacity(appeared ? 1 : 0)
-                // 把面板区域上报给 store：拖拽时据此判断指针是否在文件夹内。
-                .background {
-                    GeometryReader { panelGeo in
-                        Color.clear
-                            .onAppear {
-                                store.updateFolderPanelRect(panelGeo.frame(in: .global))
-                            }
-                            .onChange(of: panelGeo.frame(in: .global)) { _, frame in
-                                store.updateFolderPanelRect(frame)
-                            }
-                    }
-                }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
@@ -1330,6 +1394,7 @@ private struct FolderOverlay: View {
             store.renameFolder(id: folder.id, name: name)
             store.folderOverlayIsDimmed = false
             store.folderPanelRect = nil
+            store.clearFolderApplicationRects(folderID: folder.id)
         }
     }
 
@@ -1345,22 +1410,27 @@ private struct FolderOverlay: View {
     }
 }
 
-private struct FolderApplicationTile: View {
-    @EnvironmentObject private var store: LauncherStore
-    @EnvironmentObject private var controller: LauncherController
+private struct FolderApplicationTile: View, Equatable {
     let application: LauncherApplication
     let folderID: UUID
     let iconSize: CGFloat
     let tileWidth: CGFloat
+    let store: LauncherStore
+    let controller: LauncherController
+    let optionIsPressed: Bool
+    let isDragged: Bool
+    let isFolderDropTarget: Bool
 
-    private var isDragged: Bool {
-        store.draggedEntryID == application.id && store.draggedSourceFolderID == folderID
-    }
-
-    private var isFolderDropTarget: Bool {
-        store.draggedEntryID != nil
-            && store.draggedEntryID != application.id
-            && store.dragTargetID == application.id
+    static func == (lhs: FolderApplicationTile, rhs: FolderApplicationTile) -> Bool {
+        lhs.application == rhs.application
+            && lhs.folderID == rhs.folderID
+            && lhs.iconSize == rhs.iconSize
+            && lhs.tileWidth == rhs.tileWidth
+            && lhs.store === rhs.store
+            && lhs.controller === rhs.controller
+            && lhs.optionIsPressed == rhs.optionIsPressed
+            && lhs.isDragged == rhs.isDragged
+            && lhs.isFolderDropTarget == rhs.isFolderDropTarget
     }
 
     var body: some View {
@@ -1368,9 +1438,31 @@ private struct FolderApplicationTile: View {
             ZStack(alignment: .topLeading) {
                 ApplicationIcon(path: application.path)
                     .frame(width: iconSize, height: iconSize)
+                    .background {
+                        GeometryReader { iconGeometry in
+                            Color.clear
+                                .onAppear {
+                                    store.updateFolderApplicationRect(
+                                        applicationID: application.id,
+                                        folderID: folderID,
+                                        frame: iconGeometry.frame(in: .global)
+                                    )
+                                }
+                                .onChange(of: iconGeometry.frame(in: .global)) { _, frame in
+                                    store.updateFolderApplicationRect(
+                                        applicationID: application.id,
+                                        folderID: folderID,
+                                        frame: frame
+                                    )
+                                }
+                                .onDisappear {
+                                    store.removeFolderApplicationRect(applicationID: application.id, folderID: folderID)
+                                }
+                        }
+                    }
                     .contentShape(RoundedRectangle(cornerRadius: iconSize * 0.22, style: .continuous))
                     .onTapGesture { controller.launch(application) }
-                if store.optionIsPressed, !application.isProtected {
+                if optionIsPressed, !application.isProtected {
                     Button { store.requestUninstall(application) } label: {
                         Image(systemName: "xmark.circle.fill")
                             .font(.system(size: max(18, iconSize * 0.22), weight: .semibold))
@@ -1382,7 +1474,7 @@ private struct FolderApplicationTile: View {
                 }
             }
             .modifier(NativeJiggleModifier(
-                active: store.optionIsPressed,
+                active: optionIsPressed,
                 phase: Double(abs(application.id.hashValue % 997)) / 997.0 * .pi * 2
             ))
 
@@ -1393,6 +1485,32 @@ private struct FolderApplicationTile: View {
                 .shadow(color: .black.opacity(0.7), radius: 2, y: 1)
         }
         .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
+        .background {
+            GeometryReader { tileGeometry in
+                Color.clear
+                    .onAppear {
+                        store.updateFolderApplicationHitRect(
+                            applicationID: application.id,
+                            folderID: folderID,
+                            frame: tileGeometry.frame(in: .global)
+                        )
+                    }
+                    .onChange(of: tileGeometry.frame(in: .global)) { _, frame in
+                        store.updateFolderApplicationHitRect(
+                            applicationID: application.id,
+                            folderID: folderID,
+                            frame: frame
+                        )
+                    }
+                    .onDisappear {
+                        store.removeFolderApplicationHitRect(
+                            applicationID: application.id,
+                            folderID: folderID
+                        )
+                    }
+            }
+        }
         .scaleEffect(isDragged ? 0.88 : (isFolderDropTarget ? 1.06 : 1))
         .opacity(isDragged ? 0.24 : 1)
         .animation(.spring(response: 0.30, dampingFraction: 0.74), value: isDragged)
@@ -1401,12 +1519,10 @@ private struct FolderApplicationTile: View {
             withAnimation(.spring(response: 0.28, dampingFraction: 0.74)) {
                 store.beginFolderDrag(application, folderID: folderID)
             }
+            DragIconWindowController.shared.begin(path: application.path, size: iconSize)
             return NSItemProvider(object: application.url as NSURL)
         } preview: {
-            HighResolutionApplicationDragPreview(path: application.path, size: iconSize)
-                .padding(12)
-                .background(.black.opacity(0.10), in: RoundedRectangle(cornerRadius: iconSize * 0.30, style: .continuous))
-                .shadow(color: .black.opacity(0.34), radius: 18, y: 12)
+            Color.clear.frame(width: 1, height: 1)
         }
         .onDrop(
             of: [UTType.fileURL, UTType.utf8PlainText],
@@ -1430,26 +1546,29 @@ private struct FolderApplicationTile: View {
     }
 }
 
-/// 文件夹浮层空白区域的拖放委托：吞掉落点防止穿透根网格；
-/// 进入/移动时按面板位置决定保持或自动关闭，松开时面板外关闭。
+/// 文件夹浮层空白区域的拖放委托：只吞掉落点防止穿透根网格；
+/// 文件夹是否关闭由看门狗轮询指针位置决定。
 private struct FolderBlankDropDelegate: DropDelegate {
     let store: LauncherStore
 
     func dropEntered(info: DropInfo) {
-        store.folderDragHoveringBlank()
+        store.noteDragActivity()
+        store.folderDragIsActive = false
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
-        store.folderDragHoveringBlank()
+        store.noteDragActivity()
+        store.folderDragIsActive = false
         return DropProposal(operation: .move)
     }
 
     func dropExited(info: DropInfo) {
-        store.folderDragExited()
+        // Entering a tile or re-entering this backdrop supplies the next state.
+        // Exit callback ordering is unreliable while the grid is relaid out.
     }
 
     func performDrop(info: DropInfo) -> Bool {
-        store.folderDragDroppedOnBlank()
+        store.endDrag(saveLayout: true)
         return true
     }
 }
@@ -1462,16 +1581,20 @@ private struct FolderEntryDropDelegate: DropDelegate {
     let store: LauncherStore
 
     func dropEntered(info: DropInfo) {
-        store.updateFolderDrag(over: application, folderID: folderID, locationX: info.location.x, tileWidth: tileWidth)
+        // Sorting is driven by the store's row-aware global pointer tracker.
+        // SwiftUI destinations move during a reorder and can otherwise send a
+        // conflicting update for the adjacent row.
+        store.noteDragActivity()
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
-        store.updateFolderDrag(over: application, folderID: folderID, locationX: info.location.x, tileWidth: tileWidth)
+        store.noteDragActivity()
         return DropProposal(operation: .move)
     }
 
     func dropExited(info: DropInfo) {
-        store.folderDragExited()
+        // Reordering moves this destination underneath a stationary pointer
+        // and synthesizes an exit. The backdrop or next tile is authoritative.
     }
 
     func performDrop(info: DropInfo) -> Bool {
@@ -1502,7 +1625,9 @@ private struct EntryDropDelegate: DropDelegate {
     }
 
     func dropExited(info: DropInfo) {
-        store.dragExited(target)
+        // Target highlighting rebuilds this tile and can synthesize an exit
+        // while the pointer is stationary. The page background or a new tile
+        // is the authoritative signal that the old hover really ended.
     }
 
     func performDrop(info: DropInfo) -> Bool {
@@ -1530,12 +1655,38 @@ private struct PageEdgeDropDelegate: DropDelegate {
     let store: LauncherStore
 
     func dropEntered(info: DropInfo) {
-        if direction < 0 { store.pageBackward() }
-        else { store.pageForward() }
+        store.turnPageDuringDrag(direction: direction)
     }
 
-    func dropUpdated(info: DropInfo) -> DropProposal? { DropProposal(operation: .move) }
-    func performDrop(info: DropInfo) -> Bool { store.endDrag(saveLayout: true); return true }
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        store.clearRootDragTarget()
+        return DropProposal(operation: .move)
+    }
+    func performDrop(info: DropInfo) -> Bool {
+        store.completeBlankRootDrop()
+        return true
+    }
+}
+
+/// The page backdrop is the authoritative "not over a tile" destination.
+/// Using it avoids trusting the false `dropExited` callbacks produced when a
+/// highlighted tile is rebuilt by SwiftUI.
+private struct RootBlankDropDelegate: DropDelegate {
+    let store: LauncherStore
+
+    func dropEntered(info: DropInfo) {
+        store.clearRootDragTarget()
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        store.clearRootDragTarget()
+        return DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        store.completeBlankRootDrop()
+        return true
+    }
 }
 
 private struct VisualEffect: NSViewRepresentable {

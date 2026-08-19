@@ -3,6 +3,7 @@ import Combine
 import Darwin
 import Foundation
 import OSLog
+import SwiftUI
 import UniformTypeIdentifiers
 
 struct LauncherApplication: Codable, Hashable, Identifiable, Sendable {
@@ -105,21 +106,50 @@ final class LauncherStore: ObservableObject {
     /// 中途合并进自动创建的文件夹时更新，落点逻辑据此路由。
     var draggedSourceFolderID: UUID?
     private var draggedFolderApplication: LauncherApplication?
+    /// When a root app spring-loads a folder, its original root tile must stay
+    /// alive until AppKit finishes the NSDraggingSession. Removing that SwiftUI
+    /// source view mid-drag breaks delivery to the newly opened folder.
+    private var retainedRootDragSourceID: String?
     /// 拖拽开始时的 entries 快照：拖拽取消时还原，让图标动画回到原位。
     private var dragStartEntries: [LauncherEntry]?
     /// 拖拽是否正悬停在某个文件夹的磁贴上（用于“拖出文件夹自动关闭”）。
-    private var folderDragIsActive = false
+    var folderDragIsActive = false
     /// 当前打开的文件夹浮层的面板区域（屏幕坐标，与 NSEvent.mouseLocation 一致）。
     /// 指针在面板内时文件夹保持打开；离开面板才会自动关闭。
     var folderPanelRect: CGRect?
+    /// Live screen-space hit regions for the open folder. They remain usable
+    /// even when SwiftUI drop destinations miss a drag that began before the
+    /// folder overlay was inserted.
+    private var folderApplicationRects: [String: (folderID: UUID, rect: CGRect)] = [:]
+    /// Full tile regions used for sorting hit tests. The icon-only rectangles
+    /// above remain separate so the drop-return animation lands on the icon.
+    private var folderApplicationHitRects: [String: (folderID: UUID, rect: CGRect)] = [:]
+    private var rootApplicationRects: [String: CGRect] = [:]
     /// 拖拽刚自动打开文件夹的时间；宽限期内不自动关闭，
     /// 给指针时间进入面板。
     private var folderOpenedByDragAt: Date?
-    /// 本次拖拽会话中已经自动打开过的文件夹；防止自动打开→关闭→
-    /// 又自动打开的闪烁循环（指针移开后再次悬停才重新触发）。
-    private var autoOpenedFolderID: UUID?
-    private var pendingFolderAutoClose: DispatchWorkItem?
-    private var lastFolderPreviewReorderAt = Date.distantPast
+    /// 根网格中当前唯一的“悬停后打开文件夹”状态。触发时机与
+    /// 拖拽源占位的淡出动画绑定，不再由计时器轮询。
+    private var folderHoverTargetID: String?
+    private var folderHoverGeneration = 0
+    @Published private(set) var folderHoverProgress: CGFloat = 0
+    /// 指针离开文件夹框的起始时间；看门狗轮询，离开超过 1 秒即关闭。
+    private var folderOutsideSince: Date?
+    /// Folder reorder work is event-driven: while the pointer remains on the
+    /// same half of the same tile there is no new insertion slot to calculate.
+    private var lastFolderReorderTargetID: String?
+    private var lastFolderReorderPlaceAfter: Bool?
+    /// Keeps the active folder row stable while the pointer is close to the
+    /// boundary between two rows. Without hysteresis, moving layout frames can
+    /// make the nearest-row calculation alternate on every update.
+    private var folderDragLockedRowCenterY: CGFloat?
+    /// Rebuilding the page strip while the pointer remains at an edge can
+    /// synthesize another dropEntered. Debounce that reconstruction so one
+    /// edge visit advances exactly one page.
+    private var lastDragPageTurnAt = Date.distantPast
+    /// The edge currently occupied by the pointer. Staying at an edge must not
+    /// cascade through every page; moving back into the content rearms it.
+    private var activeDragPageEdge: Int?
     @Published var aliasDraft = ""
     @Published private(set) var runtimeGridColumns = 0
     @Published private(set) var runtimeGridRows = 0
@@ -142,12 +172,13 @@ final class LauncherStore: ObservableObject {
     private let hiddenKey = "hidden-applications-v1"
     private let launchEventsKey = "launch-events-v1"
     private let defaultFoldersVersionKey = "default-folders-version"
-    private var dragHoverStartedAt = Date.distantPast
     private var dragIsCentered = false
-    /// Last time `previewReorder` ran during a drag. Reorders mutate `entries`
-    /// (re-laying out the whole grid), so they are throttled to a ~60 ms cadence
-    /// instead of firing on every `dropUpdated` mouse move.
+    /// Last time `previewReorder` ran during a drag. Reorders mutate `entries`,
+    /// so raw drag events are coalesced instead of publishing every movement.
     private var lastPreviewReorderAt = Date.distantPast
+    /// 30 fps is visibly smoother than the previous ~16 fps throttle while
+    /// remaining far cheaper than rebuilding the grid for every mouse event.
+    private let dragReorderFrameInterval: TimeInterval = 1.0 / 30.0
     /// True while the "switch to custom sorting?" reorder confirmation is shown.
     @Published var reorderToCustomPrompt = false
     /// Where (relative to the target tile) the last reorder gesture intended to
@@ -163,6 +194,7 @@ final class LauncherStore: ObservableObject {
     /// the primary button is released (a live drag always holds it down).
     private var dragWatchdog: Timer?
     private var dragBeganAt = Date.distantPast
+    private var lastDragActivityAt = Date.distantPast
 
     private var aliases: [String: String] {
         get { UserDefaults.standard.dictionary(forKey: aliasesKey) as? [String: String] ?? [:] }
@@ -652,65 +684,53 @@ final class LauncherStore: ObservableObject {
     }
 
     func beginDrag(_ entry: LauncherEntry) {
+        DragIconWindowController.shared.hide()
+        cancelFolderHoverOpen()
+        openFolderID = nil
         LauncherController.dragConstraint.setActive(true)
         draggedEntryID = entry.id
         draggedSourceFolderID = nil
         draggedFolderApplication = nil
+        retainedRootDragSourceID = nil
         folderDragIsActive = false
         dragStartEntries = entries
         dragTargetID = nil
         folderCandidateID = nil
-        dragHoverStartedAt = .distantPast
+        lastFolderReorderTargetID = nil
+        lastFolderReorderPlaceAfter = nil
+        folderDragLockedRowCenterY = nil
+        lastDragPageTurnAt = .distantPast
+        activeDragPageEdge = nil
         dragBeganAt = Date()
+        lastDragActivityAt = dragBeganAt
         startDragWatchdog()
     }
 
     /// Starts a drag that carries an application out of a folder. The source
     /// lives inside a folder entry, so the drop path differs from root drags.
     func beginFolderDrag(_ application: LauncherApplication, folderID: UUID) {
+        DragIconWindowController.shared.hide()
+        cancelFolderHoverOpen()
         LauncherController.dragConstraint.setActive(true)
         draggedEntryID = application.id
         draggedSourceFolderID = folderID
         draggedFolderApplication = application
+        retainedRootDragSourceID = nil
         folderDragIsActive = false
         dragStartEntries = entries
         dragTargetID = nil
         folderCandidateID = nil
-        dragHoverStartedAt = .distantPast
+        lastFolderReorderTargetID = nil
+        lastFolderReorderPlaceAfter = nil
+        folderDragLockedRowCenterY = nil
+        lastDragPageTurnAt = .distantPast
+        activeDragPageEdge = nil
         dragBeganAt = Date()
+        lastDragActivityAt = dragBeganAt
         startDragWatchdog()
-        // 拖出文件夹：指针一旦离开文件夹面板区域，自动关闭文件夹浮层，
-        // 露出根网格方便确定落点。仍在文件夹内排序时保持打开。
-        scheduleFolderAutoClose(delay: 0.25)
     }
 
-    /// 响应式自动关闭：指针在打开中的文件夹面板内则保持打开（取消计时），
-    /// 离开面板（且不在任何文件夹磁贴上）则延迟后关闭。
-    private func scheduleFolderAutoClose(delay: TimeInterval) {
-        pendingFolderAutoClose?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            Task { @MainActor [weak self] in
-                guard let self, self.draggedEntryID != nil,
-                      self.draggedSourceFolderID != nil,
-                      !self.folderDragIsActive,
-                      !self.folderDragIsInsidePanel()
-                else { return }
-                // 拖拽刚打开的文件夹给 1.5 秒宽限期，让指针有时间进入面板；
-                // 宽限期未过时重新调度，保证即使指针停住不动也会在宽限期后关闭。
-                if let openedAt = self.folderOpenedByDragAt,
-                   Date().timeIntervalSince(openedAt) < 1.5 {
-                    self.scheduleFolderAutoClose(delay: 0.5)
-                    return
-                }
-                self.folderOpenedByDragAt = nil
-                self.openFolderID = nil
-            }
-        }
-        pendingFolderAutoClose = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
-    }
-
-    /// 指针是否在“源所在且已打开”的文件夹面板内。
+    /// 指针是否在“源所在且已打开”的文件夹框内。
     /// 矩形与鼠标都换算到 CG 全局坐标（左上原点、主屏基准）比较。
     private func folderDragIsInsidePanel() -> Bool {
         guard let rect = folderPanelRect, let openID = openFolderID,
@@ -721,21 +741,35 @@ final class LauncherStore: ObservableObject {
         return rect.contains(CGPoint(x: mouse.x, y: primaryHeight - mouse.y))
     }
 
-    /// 文件夹浮层空白区域：进入/移动时按面板位置决定保持或关闭。
-    func folderDragHoveringBlank() {
-        folderDragIsActive = false
-        if folderDragIsInsidePanel() {
-            pendingFolderAutoClose?.cancel()
-        } else {
-            scheduleFolderAutoClose(delay: 1.0)
+    /// 看门狗轮询：指针离开文件夹框（且不在任何磁贴上）超过 1 秒即关闭。
+    /// 不依赖拖放事件上报，任何位置（含 Dock 条、框外遮罩）都能判定。
+    private func checkFolderDragExit() {
+        guard draggedEntryID != nil, draggedSourceFolderID != nil else {
+            folderOutsideSince = nil
+            return
         }
-    }
-
-    /// 在文件夹浮层空白处松开：面板外关闭文件夹；面板内保持打开。
-    func folderDragDroppedOnBlank() {
-        pendingFolderAutoClose?.cancel()
-        folderDragIsActive = false
-        if !folderDragIsInsidePanel() {
+        guard let openID = openFolderID, draggedSourceFolderID == openID else {
+            folderOutsideSince = nil
+            return
+        }
+        // Only the real global pointer position is authoritative. DropDelegate
+        // enter/exit callbacks can be lost when the spring-loaded overlay
+        // replaces the root grid, leaving folderDragIsActive stuck at true.
+        if folderDragIsInsidePanel() {
+            folderOutsideSince = nil
+            return
+        }
+        // A short grace period lets the pointer enter the newly presented
+        // panel, without making an intentional drag-out feel unresponsive.
+        if let openedAt = folderOpenedByDragAt, Date().timeIntervalSince(openedAt) < 0.55 {
+            folderOutsideSince = nil
+            return
+        }
+        let since = folderOutsideSince ?? Date()
+        folderOutsideSince = since
+        if Date().timeIntervalSince(since) >= 0.45 {
+            folderOpenedByDragAt = nil
+            folderOutsideSince = nil
             openFolderID = nil
         }
     }
@@ -743,14 +777,57 @@ final class LauncherStore: ObservableObject {
     /// 文件夹浮层面板区域（CG 全局坐标，左上原点、主屏基准）。
     /// 用启动台窗口的 AppKit frame 换算，任意显示器位置都精确。
     func updateFolderPanelRect(_ frame: CGRect) {
-        guard let windowFrame = LauncherController.shared.presentedWindowFrame,
-              let primaryHeight = NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.height
-        else {
+        guard let converted = launcherGlobalFrameToScreenFrame(frame) else {
             folderPanelRect = nil
             return
         }
+        folderPanelRect = converted
+    }
+
+    func updateFolderApplicationRect(applicationID: String, folderID: UUID, frame: CGRect) {
+        guard openFolderID == folderID,
+              let converted = launcherGlobalFrameToScreenFrame(frame)
+        else { return }
+        folderApplicationRects[applicationID] = (folderID, converted)
+    }
+
+    func updateFolderApplicationHitRect(applicationID: String, folderID: UUID, frame: CGRect) {
+        guard openFolderID == folderID,
+              let converted = launcherGlobalFrameToScreenFrame(frame)
+        else { return }
+        folderApplicationHitRects[applicationID] = (folderID, converted)
+    }
+
+    func updateRootApplicationRect(entryID: String, frame: CGRect) {
+        guard let converted = launcherGlobalFrameToScreenFrame(frame) else { return }
+        rootApplicationRects[entryID] = converted
+    }
+
+    func removeRootApplicationRect(entryID: String) {
+        rootApplicationRects.removeValue(forKey: entryID)
+    }
+
+    func removeFolderApplicationRect(applicationID: String, folderID: UUID) {
+        guard folderApplicationRects[applicationID]?.folderID == folderID else { return }
+        folderApplicationRects.removeValue(forKey: applicationID)
+    }
+
+    func removeFolderApplicationHitRect(applicationID: String, folderID: UUID) {
+        guard folderApplicationHitRects[applicationID]?.folderID == folderID else { return }
+        folderApplicationHitRects.removeValue(forKey: applicationID)
+    }
+
+    func clearFolderApplicationRects(folderID: UUID) {
+        folderApplicationRects = folderApplicationRects.filter { $0.value.folderID != folderID }
+        folderApplicationHitRects = folderApplicationHitRects.filter { $0.value.folderID != folderID }
+    }
+
+    private func launcherGlobalFrameToScreenFrame(_ frame: CGRect) -> CGRect? {
+        guard let windowFrame = LauncherController.shared.presentedWindowFrame,
+              let primaryHeight = NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.height
+        else { return nil }
         let windowTopLeftCG = CGPoint(x: windowFrame.minX, y: primaryHeight - windowFrame.maxY)
-        folderPanelRect = CGRect(
+        return CGRect(
             x: windowTopLeftCG.x + frame.minX,
             y: windowTopLeftCG.y + frame.minY,
             width: frame.width,
@@ -760,7 +837,9 @@ final class LauncherStore: ObservableObject {
 
     private func startDragWatchdog() {
         dragWatchdog?.invalidate()
-        let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+        // LazyVGrid can skip dropUpdated while moving its children. Polling at
+        // 30 Hz fills those gaps without publishing model state every frame.
+        let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.checkDragWatchdog()
             }
@@ -774,19 +853,324 @@ final class LauncherStore: ObservableObject {
             dragWatchdog?.invalidate(); dragWatchdog = nil
             return
         }
+        let now = Date()
+        checkFolderDragExit()
+        updateFolderDragFromGlobalPointer()
+        checkDragPageEdge()
         // A live drag keeps the primary button held. Once it's released and
         // `draggedEntryID` is still set, the session was cancelled (Esc) or the
         // item was dropped outside any target — recover the dragged tile. The
         // grace period lets the session actually start before we watch.
         let leftButtonHeld = NSEvent.pressedMouseButtons & 1 != 0
-        guard !leftButtonHeld, Date().timeIntervalSince(dragBeganAt) > 0.4 else { return }
+        guard !leftButtonHeld,
+              now.timeIntervalSince(dragBeganAt) > 0.4,
+              now.timeIntervalSince(lastDragActivityAt) > 1.25
+        else { return }
         // 拖拽被取消（Esc / 松手在无效区域）：关闭拖拽期间打开的文件夹。
         openFolderID = nil
         endDrag(revertPreview: true)
     }
 
+    /// Native drag sessions do not reliably discover SwiftUI drop views that
+    /// are inserted after the drag starts. Hit-test the live folder tile frames
+    /// directly so opening a folder never interrupts continued sorting.
+    private func updateFolderDragFromGlobalPointer() {
+        guard let folderID = openFolderID,
+              draggedSourceFolderID == folderID,
+              let folder = folder(id: folderID)
+        else { return }
+        let mouse = screenTopLeftMouseLocation()
+        let candidates = folderApplicationHitRects.filter {
+            $0.value.folderID == folderID && $0.key != draggedEntryID
+        }
+        guard folderPanelRect?.contains(mouse) == true, !candidates.isEmpty else { return }
+
+        // Build stable visual rows from the live tile centers.
+        let sortedY = candidates.map { $0.value.rect.midY }.sorted()
+        var rowCenters: [CGFloat] = []
+        var rowCounts: [CGFloat] = []
+        for y in sortedY {
+            if let last = rowCenters.indices.last, abs(rowCenters[last] - y) < 28 {
+                let count = rowCounts[last]
+                rowCenters[last] = (rowCenters[last] * count + y) / (count + 1)
+                rowCounts[last] = count + 1
+            } else {
+                rowCenters.append(y)
+                rowCounts.append(1)
+            }
+        }
+
+        var rowIndex: Int
+        if let locked = folderDragLockedRowCenterY {
+            rowIndex = rowCenters.indices.min(by: {
+                abs(rowCenters[$0] - locked) < abs(rowCenters[$1] - locked)
+            }) ?? 0
+        } else {
+            rowIndex = rowCenters.indices.min(by: {
+                abs(rowCenters[$0] - mouse.y) < abs(rowCenters[$1] - mouse.y)
+            }) ?? 0
+        }
+
+        // Require a deliberate 16pt crossing beyond the midpoint before
+        // changing rows. Horizontal slot changes remain immediate.
+        let rowHysteresis: CGFloat = 16
+        while rowIndex > 0 {
+            let boundary = (rowCenters[rowIndex - 1] + rowCenters[rowIndex]) / 2
+            guard mouse.y < boundary - rowHysteresis else { break }
+            rowIndex -= 1
+        }
+        while rowIndex + 1 < rowCenters.count {
+            let boundary = (rowCenters[rowIndex] + rowCenters[rowIndex + 1]) / 2
+            guard mouse.y > boundary + rowHysteresis else { break }
+            rowIndex += 1
+        }
+        let selectedRowCenter = rowCenters[rowIndex]
+        folderDragLockedRowCenterY = selectedRowCenter
+
+        let rowCandidates = candidates.filter { candidate in
+            let nearestRow = rowCenters.min(by: {
+                abs($0 - candidate.value.rect.midY) < abs($1 - candidate.value.rect.midY)
+            })
+            return nearestRow == selectedRowCenter
+        }
+        let hit = rowCandidates.first(where: { $0.value.rect.contains(mouse) })
+            ?? rowCandidates.min(by: {
+                abs($0.value.rect.midX - mouse.x) < abs($1.value.rect.midX - mouse.x)
+            })
+        guard let hit,
+              let application = folder.applications.first(where: { $0.id == hit.key }),
+              application.id != draggedEntryID
+        else { return }
+        updateFolderDrag(
+            over: application,
+            folderID: folderID,
+            locationX: mouse.x - hit.value.rect.minX,
+            tileWidth: hit.value.rect.width
+        )
+    }
+
+    private func screenTopLeftMouseLocation() -> CGPoint {
+        let mouse = NSEvent.mouseLocation
+        let primaryHeight = NSScreen.screens.first(where: { $0.frame.origin == .zero })?.frame.height ?? 0
+        return CGPoint(x: mouse.x, y: primaryHeight - mouse.y)
+    }
+
+    /// Hands the pointer-following AppKit drag icon directly to its return
+    /// animation. SwiftUI's native dragging image is transparent, so there is
+    /// never a second image waiting under the pointer for AppKit to fade out.
+    private func beginDropReturnAnimationIfPossible() {
+        guard let draggedEntryID else {
+            DragIconWindowController.shared.hide()
+            return
+        }
+        let application = draggedFolderApplication
+            ?? searchableApplications.first(where: { $0.id == draggedEntryID })
+        guard application != nil else {
+            DragIconWindowController.shared.hide()
+            return
+        }
+
+        let destinationRect: CGRect?
+        if let openFolderID,
+           let folderRect = folderApplicationRects[draggedEntryID],
+           folderRect.folderID == openFolderID
+        {
+            destinationRect = folderRect.rect
+        } else {
+            destinationRect = rootApplicationRects[draggedEntryID]
+                ?? folderApplicationRects[draggedEntryID]?.rect
+        }
+        guard let destinationRect else {
+            DragIconWindowController.shared.hide()
+            return
+        }
+        DragIconWindowController.shared.returnTo(
+            destination: destinationRect,
+            targetSize: min(112, max(56, min(destinationRect.width, destinationRect.height)))
+        )
+    }
+
+    /// Global pointer based page spring-loading. SwiftUI drop destinations are
+    /// rebuilt as `currentPage` changes and can lose `dropEntered`; the AppKit
+    /// panel frame and NSEvent pointer remain stable for the whole session.
+    private func checkDragPageEdge() {
+        guard draggedEntryID != nil,
+              openFolderID == nil,
+              let frame = LauncherController.shared.presentedWindowFrame
+        else {
+            activeDragPageEdge = nil
+            return
+        }
+
+        let mouse = NSEvent.mouseLocation
+        let edgeWidth: CGFloat = 72
+        let direction: Int?
+        if mouse.x <= frame.minX + edgeWidth {
+            direction = -1
+        } else if mouse.x >= frame.maxX - edgeWidth {
+            direction = 1
+        } else {
+            direction = nil
+        }
+
+        guard direction != activeDragPageEdge else { return }
+        activeDragPageEdge = direction
+        guard let direction else { return }
+        turnPageDuringDrag(direction: direction)
+    }
+
+    /// Called by the session event tap after a real mouse-up. Valid SwiftUI
+    /// destinations finish synchronously first; if state remains, the drop was
+    /// outside every destination and its preview must be rolled back.
+    func finishAbandonedDragIfNeeded() {
+        guard draggedEntryID != nil else { return }
+        if let folderID = openFolderID, draggedSourceFolderID == folderID {
+            let mouse = screenTopLeftMouseLocation()
+            if let hit = folderApplicationRects.first(where: {
+                $0.value.folderID == folderID && $0.value.rect.contains(mouse)
+            }), let folder = folder(id: folderID),
+               let application = folder.applications.first(where: { $0.id == hit.key }),
+               application.id != draggedEntryID
+            {
+                completeFolderDrop(
+                    on: application,
+                    folderID: folderID,
+                    locationX: mouse.x - hit.value.rect.minX,
+                    tileWidth: hit.value.rect.width
+                )
+                return
+            }
+            // Dropping on empty space inside the folder keeps the current
+            // preview order and commits the spring-loaded insertion.
+            if folderPanelRect?.contains(mouse) == true {
+                endDrag(saveLayout: true)
+                return
+            }
+        }
+        openFolderID = nil
+        endDrag(revertPreview: true)
+    }
+
+    /// Drop callbacks are also the drag-session heartbeat. Do not infer that a
+    /// trackpad drag ended solely from `pressedMouseButtons`: AppKit may report
+    /// zero while NSDraggingSession is still active.
+    func noteDragActivity() {
+        guard draggedEntryID != nil else { return }
+        lastDragActivityAt = Date()
+    }
+
+    /// Start one compositor-driven placeholder fade. Its completion is the
+    /// spring-load signal, so no hover timer or polling is involved.
+    private func scheduleFolderHoverOpen(on target: LauncherEntry, delay: TimeInterval) {
+        let targetID = target.id
+        if folderHoverTargetID == targetID { return }
+
+        cancelFolderHoverOpen()
+        folderHoverTargetID = targetID
+        folderHoverGeneration &+= 1
+        let generation = folderHoverGeneration
+        withAnimation(.linear(duration: delay), completionCriteria: .logicallyComplete) {
+            folderHoverProgress = 1
+        } completion: { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.completeFolderHoverOpen(targetID: targetID, generation: generation)
+            }
+        }
+    }
+
+    private func cancelFolderHoverOpen() {
+        folderHoverTargetID = nil
+        folderHoverGeneration &+= 1
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            folderHoverProgress = 0
+        }
+    }
+
+    /// The page background and page-edge destinations call this when the
+    /// pointer is no longer over a tile. Tile `dropExited` itself is deliberately
+    /// ignored: SwiftUI emits a false exit whenever target highlighting rebuilds
+    /// a tile, even though a stationary pointer never actually left it.
+    func clearRootDragTarget() {
+        guard draggedEntryID != nil else { return }
+        // 文件夹内拖拽时不干扰：文件夹浮层覆盖在根网格上，
+        // 空白区域的 drop 事件不应清空文件夹内的 dragTargetID。
+        if folderDragIsActive { return }
+        noteDragActivity()
+        cancelFolderHoverOpen()
+        if dragTargetID != nil { dragTargetID = nil }
+        if folderCandidateID != nil { folderCandidateID = nil }
+        dragIsCentered = false
+    }
+
+    /// The source placeholder has completed its fade. Resolve the target by its
+    /// stable ID, consume the placeholder and open the resulting folder as one
+    /// state transition.
+    private func completeFolderHoverOpen(targetID: String, generation: Int) {
+        guard folderHoverGeneration == generation,
+              folderHoverTargetID == targetID,
+              draggedEntryID != nil,
+              dragTargetID == targetID,
+              dragIsCentered,
+              let target = entries.first(where: { $0.id == targetID })
+        else { return }
+
+        let folderID: UUID?
+        switch target {
+        case .folder(let folder):
+            if draggedSourceFolderID == folder.id {
+                folderID = folder.id
+            } else {
+                folderID = mergeDraggedIntoFolder(folder.id)
+            }
+        case .application:
+            guard draggedSourceFolderID == nil else { return }
+            folderID = autoCreateFolder(on: target)
+        }
+
+        guard let folderID else {
+            cancelFolderHoverOpen()
+            return
+        }
+        let now = Date()
+        // Invalidate the completion token without first restoring the source
+        // placeholder. It is already part of the destination folder now.
+        folderHoverTargetID = nil
+        folderHoverGeneration &+= 1
+        // Commit the bookkeeping without animating the root-grid mutation.
+        // The folder presentation itself is performed in a separate animated
+        // transaction below; previously `openFolderID` was included in this
+        // disabled transaction, so spring-loaded folders appeared instantly.
+        var bookkeepingTransaction = Transaction(animation: nil)
+        bookkeepingTransaction.disablesAnimations = true
+        withTransaction(bookkeepingTransaction) {
+            folderCandidateID = nil
+            folderHoverProgress = 0
+            folderOutsideSince = nil
+            folderOpenedByDragAt = now
+            lastDragActivityAt = now
+            folderApplicationRects.removeAll(keepingCapacity: true)
+            folderApplicationHitRects.removeAll(keepingCapacity: true)
+            folderDragLockedRowCenterY = nil
+        }
+
+        let openingAnimation: Animation? = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            ? nil
+            : .spring(response: 0.42, dampingFraction: 0.84, blendDuration: 0.08)
+        withAnimation(openingAnimation) {
+            folderOverlayIsDimmed = true
+            openFolderID = folderID
+        }
+    }
+
     func updateDrag(over target: LauncherEntry, locationX: CGFloat, tileWidth: CGFloat) {
         guard draggedEntryID != nil, draggedEntryID != target.id else { return }
+        noteDragActivity()
+        // A root DropDelegate can receive one last periodic callback after its
+        // folder has spring-loaded. It is stale: the source already belongs to
+        // the visible folder, so never let it clear openFolderID.
+        if let openFolderID, draggedSourceFolderID == openFolderID { return }
         let targetIsFolder: Bool
         if case .folder = target { targetIsFolder = true }
         else { targetIsFolder = false }
@@ -803,35 +1187,9 @@ final class LauncherStore: ObservableObject {
         let centered = targetIsFolder || abs(locationX - tileWidth / 2) < centerBand / 2
 
         if dragTargetID != target.id {
+            cancelFolderHoverOpen()
             dragTargetID = target.id
-            // 新目标：允许再次自动打开文件夹（移开后重新悬停可重触发）。
-            autoOpenedFolderID = nil
             folderCandidateID = targetIsFolder ? target.id : nil
-            dragHoverStartedAt = Date()
-            if !targetIsFolder {
-                let targetID = target.id
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.34) { [weak self] in
-                    guard let self, self.draggedEntryID != nil,
-                          self.dragTargetID == targetID, self.dragIsCentered else { return }
-                    self.folderCandidateID = targetID
-                }
-                // 悬停 1.5 秒：自动把两个应用合并成文件夹并打开，
-                // 拖拽不结束，可继续在文件夹内排序。
-                let sourceInRoot = self.draggedSourceFolderID == nil
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-                    guard let self, self.draggedEntryID != nil,
-                          self.dragTargetID == targetID, self.dragIsCentered,
-                          self.draggedSourceFolderID == nil, sourceInRoot,
-                          self.folderCandidateID == targetID
-                    else { return }
-                    if let folderID = self.autoCreateFolder(on: target) {
-                        self.folderCandidateID = nil
-                        self.openFolderID = folderID
-                        self.folderOpenedByDragAt = Date()
-                        self.autoOpenedFolderID = folderID
-                    }
-                }
-            }
         }
 
         dragIsCentered = centered
@@ -839,38 +1197,22 @@ final class LauncherStore: ObservableObject {
             // A folder is a stable drop target across its entire tile. Never run
             // preview reordering here, otherwise a folder at the end of a row is
             // pushed onto the next row just as the pointer enters it.
-            folderCandidateID = target.id
-            // 悬停 1 秒：把拖入的应用合并进文件夹并打开，
-            // 之后可在文件夹内继续拖动排序。
-            if case .folder(let folder) = target, folder.id != draggedSourceFolderID {
-                let folderID = folder.id
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                    guard let self, self.draggedEntryID != nil,
-                          self.dragTargetID == "folder:\(folderID.uuidString)",
-                          self.openFolderID != folderID,
-                          self.autoOpenedFolderID != folderID
-                    else { return }
-                    if let mergedFolderID = self.mergeDraggedIntoFolder(folderID) {
-                        self.openFolderID = mergedFolderID
-                        self.folderOpenedByDragAt = Date()
-                        self.autoOpenedFolderID = mergedFolderID
-                    }
-                }
-            }
+            if folderCandidateID != target.id { folderCandidateID = target.id }
+            scheduleFolderHoverOpen(on: target, delay: 0.8)
             return
         }
         if centered {
-            if Date().timeIntervalSince(dragHoverStartedAt) > 0.33 {
-                folderCandidateID = target.id
-            }
+            if folderCandidateID != target.id { folderCandidateID = target.id }
+            scheduleFolderHoverOpen(on: target, delay: 1.0)
         } else {
-            folderCandidateID = nil
+            cancelFolderHoverOpen()
+            if folderCandidateID != nil { folderCandidateID = nil }
             lastDragPlaceAfter = locationX > tileWidth / 2
             // A sorted grid owns its order, so only custom mode previews the
             // live squeeze. The drop slot is still tracked for the confirm step.
             guard sortMode == .custom else { return }
             let now = Date()
-            guard now.timeIntervalSince(lastPreviewReorderAt) >= 0.06 else { return }
+            guard now.timeIntervalSince(lastPreviewReorderAt) >= dragReorderFrameInterval else { return }
             lastPreviewReorderAt = now
             previewReorder(around: target, placeAfter: lastDragPlaceAfter)
         }
@@ -879,33 +1221,31 @@ final class LauncherStore: ObservableObject {
     /// 文件夹磁贴上悬停（拖入/文件夹内排序的实时反馈）。
     func updateFolderDrag(over targetApplication: LauncherApplication, folderID: UUID, locationX: CGFloat, tileWidth: CGFloat) {
         guard draggedEntryID != nil, draggedEntryID != targetApplication.id else { return }
+        noteDragActivity()
         folderDragIsActive = true
-        pendingFolderAutoClose?.cancel()
-        dragTargetID = targetApplication.id
-        dragHoverStartedAt = Date()
-        let centerBand = max(44, tileWidth * 0.46)
-        let centered = abs(locationX - tileWidth / 2) < centerBand / 2
-        dragIsCentered = centered
-        if centered {
-            folderCandidateID = targetApplication.id
-            return
+        if dragTargetID != targetApplication.id {
+            dragTargetID = targetApplication.id
         }
-        folderCandidateID = nil
+        // Inside a folder there is no app-on-app merge action. The entire tile
+        // is therefore a reorder destination; its center line only decides
+        // whether the insertion slot is before or after the target.
+        dragIsCentered = false
+        if folderCandidateID != nil { folderCandidateID = nil }
         lastDragPlaceAfter = locationX > tileWidth / 2
         // 仅当源就在本文件夹内时实时预览排序。
         guard draggedSourceFolderID == folderID else { return }
-        let now = Date()
-        guard now.timeIntervalSince(lastFolderPreviewReorderAt) >= 0.06 else { return }
-        lastFolderPreviewReorderAt = now
+        // Resolve against the live folder order. A preview moves the target
+        // view under the pointer, so cached target/side pairs can suppress the
+        // next legitimate move after SwiftUI rebuilds the grid.
         previewFolderReorder(over: targetApplication, folderID: folderID, placeAfter: lastDragPlaceAfter)
     }
 
-    /// 指针离开文件夹磁贴（可能进入面板空白，由 folderDragHoveringBlank 接管）。
-    func folderDragExited() {
+    /// 指针离开文件夹磁贴。
+    func folderDragExited(_ targetApplicationID: String? = nil) {
+        if let targetApplicationID, dragTargetID != targetApplicationID { return }
         folderDragIsActive = false
-        dragTargetID = nil
-        folderCandidateID = nil
-        dragHoverStartedAt = .distantPast
+        if dragTargetID != nil { dragTargetID = nil }
+        if folderCandidateID != nil { folderCandidateID = nil }
     }
 
     /// 在文件夹磁贴上松开：源已在本文件夹内则按位置排序；
@@ -994,10 +1334,19 @@ final class LauncherStore: ObservableObject {
     private func pullDraggedSourceIntoRootEntries(at target: LauncherEntry, locationX: CGFloat, tileWidth: CGFloat) {
         guard draggedSourceFolderID != nil, let application = removeDraggedSource() else { return }
         let placeAfter = locationX > tileWidth / 2
-        if let targetIndex = entries.firstIndex(where: { $0.id == target.id }) {
-            entries.insert(.application(application), at: min(entries.count, targetIndex + (placeAfter ? 1 : 0)))
+        let rootEntry: LauncherEntry
+        if let retainedRootDragSourceID,
+           let retainedIndex = entries.firstIndex(where: { $0.id == retainedRootDragSourceID })
+        {
+            rootEntry = entries.remove(at: retainedIndex)
+            self.retainedRootDragSourceID = nil
         } else {
-            entries.append(.application(application))
+            rootEntry = .application(application)
+        }
+        if let targetIndex = entries.firstIndex(where: { $0.id == target.id }) {
+            entries.insert(rootEntry, at: min(entries.count, targetIndex + (placeAfter ? 1 : 0)))
+        } else {
+            entries.append(rootEntry)
         }
         draggedSourceFolderID = nil
         draggedFolderApplication = nil
@@ -1032,33 +1381,68 @@ final class LauncherStore: ObservableObject {
     /// 把拖拽中的应用合并进现有文件夹（拖拽状态保留，可继续排序）。
     @discardableResult
     private func mergeDraggedIntoFolder(_ folderID: UUID) -> UUID? {
-        guard let application = removeDraggedSource() else { return nil }
-        guard let index = entries.firstIndex(where: {
+        // Build the result off-screen and publish once. The old implementation
+        // published source removal, destination insertion and normalization as
+        // three separate layouts, which exposed a frame where the placeholder
+        // had vanished but the folder was not open yet.
+        var updatedEntries = entries
+        let application: LauncherApplication?
+        if let sourceFolderID = draggedSourceFolderID,
+           let sourceApplication = draggedFolderApplication
+        {
+            if sourceFolderID == folderID { return folderID }
+            guard let sourceFolderIndex = updatedEntries.firstIndex(where: {
+                if case .folder(let folder) = $0 { return folder.id == sourceFolderID }
+                return false
+            }), case .folder(var sourceFolder) = updatedEntries[sourceFolderIndex]
+            else { return nil }
+            sourceFolder.applications.removeAll { $0.id == sourceApplication.id }
+            updatedEntries[sourceFolderIndex] = .folder(sourceFolder)
+            application = sourceApplication
+        } else if let sourceID = draggedEntryID,
+                  let sourceIndex = updatedEntries.firstIndex(where: { $0.id == sourceID }),
+                  case .application(let sourceApplication) = updatedEntries[sourceIndex]
+        {
+            // Retain the original root entry as the live AppKit drag source.
+            // The root grid is hidden by the folder overlay, so the duplicate
+            // is not visible; `endDrag` removes it atomically after the drop.
+            retainedRootDragSourceID = sourceID
+            application = sourceApplication
+        } else {
+            application = nil
+        }
+        guard let application else { return nil }
+        guard let index = updatedEntries.firstIndex(where: {
             if case .folder(let folder) = $0 { return folder.id == folderID }
             return false
-        }), case .folder(var folder) = entries[index] else {
+        }), case .folder(var folder) = updatedEntries[index] else {
             // 目标文件夹已不存在（如被解散）：把应用放回根网格。
-            entries.append(.application(application))
-            normalizeFolders()
+            updatedEntries.append(.application(application))
+            entries = normalizedFolderEntries(updatedEntries)
             save()
             return nil
         }
         guard !folder.applications.contains(where: { $0.id == application.id }) else {
+            // The source may have come from another folder; still publish its
+            // removal once so the model has a single owner for the application.
+            entries = normalizedFolderEntries(updatedEntries)
             draggedSourceFolderID = folderID
             draggedFolderApplication = application
+            dragStartEntries = nil
+            save()
             return folderID
         }
         folder.applications.append(application)
-        entries[index] = .folder(folder)
+        updatedEntries[index] = .folder(folder)
         draggedSourceFolderID = folderID
         draggedFolderApplication = application
-        dragStartEntries = nil
-        normalizeFolders()
+        entries = normalizedFolderEntries(updatedEntries)
         save()
         return folderID
     }
 
-    /// 悬停 1.5 秒后立即创建文件夹并打开（拖拽状态保留，可继续排序）。
+    /// 把当前根应用与目标应用组成文件夹。调用者紧接着打开该文件夹，
+    /// 拖拽源随即切换为文件夹内应用，供浮层中的排序逻辑继续处理。
     @discardableResult
     private func autoCreateFolder(on target: LauncherEntry) -> UUID? {
         guard let sourceID = draggedEntryID, sourceID != target.id,
@@ -1067,24 +1451,49 @@ final class LauncherStore: ObservableObject {
               let targetIndex = entries.firstIndex(where: { $0.id == target.id }),
               case .application(let targetApplication) = entries[targetIndex]
         else { return nil }
-        entries.remove(at: sourceIndex)
-        let adjustedTarget = targetIndex > sourceIndex ? targetIndex - 1 : targetIndex
+        var updatedEntries = entries
         let folder = LauncherFolder(
             id: UUID(),
             name: suggestedFolderName(for: [targetApplication, sourceApplication]),
             applications: [targetApplication, sourceApplication],
             createdAt: Date()
         )
-        entries[adjustedTarget] = .folder(folder)
-        // 源已进入文件夹：更新拖拽源位置，后续落点按“文件夹内”处理。
+        // Keep the source root tile alive until the native dragging session
+        // ends; only replace the hovered target with the new folder.
+        updatedEntries[targetIndex] = .folder(folder)
+        // 源已进入文件夹：更新拖拽源位置，后续落点按”文件夹内”处理。
         draggedSourceFolderID = folder.id
         draggedFolderApplication = sourceApplication
-        dragStartEntries = nil
+        retainedRootDragSourceID = sourceID
+        entries = updatedEntries
         save()
         return folder.id
     }
 
+    /// Pure normalization helper used by drag transitions so intermediate
+    /// arrays never reach SwiftUI.
+    private func normalizedFolderEntries(_ values: [LauncherEntry]) -> [LauncherEntry] {
+        values.flatMap { entry -> [LauncherEntry] in
+            guard case .folder(let folder) = entry else { return [entry] }
+            switch folder.applications.count {
+            case 0: return []
+            case 1: return [.application(folder.applications[0])]
+            default: return [entry]
+            }
+        }
+    }
+
     func completeDrop(on target: LauncherEntry, locationX: CGFloat? = nil, tileWidth: CGFloat = 0) {
+        // A spring-loaded folder replaces the root destination in the middle of
+        // the same NSDraggingSession. AppKit can still deliver `performDrop` to
+        // the old root delegate (especially when an application target was
+        // replaced by a newly-created folder). The source is already inside the
+        // visible folder, so this stale callback must only finish the session;
+        // routing it through completeFolderDrag would pull the app back out.
+        if let openFolderID, draggedSourceFolderID == openFolderID {
+            endDrag(saveLayout: true)
+            return
+        }
         // The source currently lives inside a folder: the drop routes through
         // the folder-aware path (insert next to the target / merge).
         if draggedSourceFolderID != nil {
@@ -1150,11 +1559,20 @@ final class LauncherStore: ObservableObject {
         endDrag()
     }
 
-    /// Drop on blank space: pull the app out of its folder onto the root grid.
-    func dropDraggedFolderAppToRoot() {
+    /// Drop on blank root space. A folder source is pulled out; a root source
+    /// is moved into the currently visible page, which also makes edge-paging
+    /// followed by a blank-space drop a real cross-page reorder.
+    func completeBlankRootDrop() {
         // 拖拽期间源已取出到根网格（有实时预览位置）：保留当前位置即可。
         guard draggedSourceFolderID != nil else {
-            endDrag()
+            // The live reorder preview already owns the placeholder position.
+            // A blank-area performDrop is often AppKit's fallback after the
+            // target tile moved away during layout; moving to the page tail
+            // here discards that valid placeholder and makes the icon jump.
+            // Persist the current preview order unchanged. If no preview move
+            // occurred, this naturally snaps back to the original slot.
+            dragStartEntries = nil
+            endDrag(saveLayout: true)
             return
         }
         guard let application = removeDraggedSource() else {
@@ -1162,11 +1580,33 @@ final class LauncherStore: ObservableObject {
             return
         }
         openFolderID = nil
-        entries.append(.application(application))
+        if let retainedRootDragSourceID,
+           let retainedIndex = entries.firstIndex(where: { $0.id == retainedRootDragSourceID })
+        {
+            let retainedEntry = entries.remove(at: retainedIndex)
+            entries.append(retainedEntry)
+            self.retainedRootDragSourceID = nil
+        } else {
+            entries.append(.application(application))
+        }
         dragStartEntries = nil
         normalizeFolders()
         save()
         endDrag()
+    }
+
+    /// Turns one page for an active icon drag. The timestamp prevents the
+    /// freshly rebuilt edge destination from immediately turning a second page.
+    func turnPageDuringDrag(direction: Int) {
+        guard draggedEntryID != nil else { return }
+        noteDragActivity()
+        clearRootDragTarget()
+        let now = Date()
+        guard now.timeIntervalSince(lastDragPageTurnAt) >= 0.45 else { return }
+        let oldPage = currentPage
+        if direction < 0 { pageBackward() }
+        else { pageForward() }
+        if currentPage != oldPage { lastDragPageTurnAt = now }
     }
 
     /// The user confirmed switching to custom sorting for a dropped reorder.
@@ -1202,35 +1642,46 @@ final class LauncherStore: ObservableObject {
         pendingReorderTargetID = nil
     }
 
-    func dragExited(_ target: LauncherEntry) {
-        guard dragTargetID == target.id else { return }
-        dragTargetID = nil
-        folderCandidateID = nil
-        dragHoverStartedAt = .distantPast
-        dragIsCentered = false
-    }
-
     func endDrag(saveLayout: Bool = false, revertPreview: Bool = false) {
+        beginDropReturnAnimationIfPossible()
         dragWatchdog?.invalidate(); dragWatchdog = nil
+        cancelFolderHoverOpen()
         LauncherController.dragConstraint.setActive(false)
-        pendingFolderAutoClose?.cancel()
-        pendingFolderAutoClose = nil
         folderOpenedByDragAt = nil
-        autoOpenedFolderID = nil
+        folderOutsideSince = nil
+        var finalizedRetainedSource = false
         // 拖拽取消时把实时让位预览还原，图标回到拖拽前的位置。
         if revertPreview, let dragStartEntries {
             entries = dragStartEntries
+        } else if let retainedRootDragSourceID,
+                  let rootIndex = entries.firstIndex(where: {
+                      guard $0.id == retainedRootDragSourceID else { return false }
+                      if case .application = $0 { return true }
+                      return false
+                  })
+        {
+            // The folder now owns the app. Remove only its temporary root
+            // source tile after AppKit has delivered the final drop.
+            entries.remove(at: rootIndex)
+            finalizedRetainedSource = true
         }
         dragStartEntries = nil
         draggedEntryID = nil
         draggedSourceFolderID = nil
         draggedFolderApplication = nil
+        retainedRootDragSourceID = nil
         folderDragIsActive = false
         dragTargetID = nil
         folderCandidateID = nil
-        dragHoverStartedAt = .distantPast
         dragIsCentered = false
-        if saveLayout { save() }
+        lastFolderReorderTargetID = nil
+        lastFolderReorderPlaceAfter = nil
+        folderDragLockedRowCenterY = nil
+        lastDragPageTurnAt = .distantPast
+        activeDragPageEdge = nil
+        folderApplicationRects.removeAll(keepingCapacity: true)
+        folderApplicationHitRects.removeAll(keepingCapacity: true)
+        if saveLayout || finalizedRetainedSource { save() }
     }
 
     private func previewReorder(around target: LauncherEntry, placeAfter: Bool) {
