@@ -2116,13 +2116,10 @@ final class LauncherStore: ObservableObject {
                 guard url.pathExtension.caseInsensitiveCompare("app") == .orderedSame else { continue }
                 enumerator.skipDescendants()
                 guard let bundle = Bundle(url: url) else { continue }
-                // macOS 的启动台不显示纯菜单栏应用（LSUIElement）和后台代理
-                // 应用（LSBackgroundOnly），LunchPad 保持一致。注意：不做
-                // Launch Services 注册检查——未注册/当前系统不支持的应用
-                // （如仅支持到 macOS 26 的 Xcode）仍然展示。
-                let lsuiElement = (bundle.object(forInfoDictionaryKey: "LSUIElement") as? NSNumber)?.boolValue ?? false
+                // 仅跳过后台代理应用（LSBackgroundOnly），它们没有 UI。
+                // LSUIElement 应用（菜单栏应用等）保留显示——macOS 启动台同样展示。
                 let lsBackgroundOnly = (bundle.object(forInfoDictionaryKey: "LSBackgroundOnly") as? NSNumber)?.boolValue ?? false
-                if lsuiElement || lsBackgroundOnly { continue }
+                if lsBackgroundOnly { continue }
                 let standardizedPath = url.resolvingSymlinksInPath().standardizedFileURL.path
                 let displayName = (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
                     ?? (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String)

@@ -585,9 +585,7 @@ struct PreviewWindowCard: View {
             .fixedSize()
             .contentShape(Rectangle())
             .onHover { hovering in
-                withAnimation(Defaults.shared.showAnimations ? .snappy(duration: 0.175) : nil) {
-                    isHovering = hovering
-                }
+                isHovering = hovering
             }
             .onTapGesture {
                 if window.isMinimized {
@@ -730,7 +728,6 @@ struct PreviewWindowCard: View {
             .padding(2)
             .opacity((finalIsSelected || isHovering) ? 1.0 : 0.25)
             .materialPill()
-            .allowsHitTesting((finalIsSelected || isHovering))
         } else if window.isMinimized || window.isHidden {
             // 与流量灯按钮（14pt 图标 + 2pt 内边距 + 胶囊）完全同构同高，
             // 文字用 caption 字号避免在定高框内溢出。
@@ -1025,13 +1022,20 @@ final class DockPreviewTrackingView: NSView {
     private let dockItemElement: AXUIElement?
     private var fadeOutTimer: Timer?
     private var inactivityCheckTimer: Timer?
+    private var mouseOutsideSince: Date?
+    /// 隐藏动画进行中：忽略 tracking area 事件，避免反向滑入时 frame 移动触发虚假 mouseExited。
+    var isHiding = false
 
     init(dockPosition: DockPosition, dockItemElement: AXUIElement?) {
         self.dockPosition = dockPosition
         self.dockItemElement = dockItemElement
         super.init(frame: .zero)
-        setupTrackingArea()
-        startInactivityMonitoring()
+        // 延迟设置 tracking area，等面板滑入动画完成后再监听鼠标事件，
+        // 避免动画期间 frame 变化触发虚假的 mouseExited/mouseEntered。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            self?.setupTrackingArea()
+            self?.startInactivityMonitoring()
+        }
     }
 
     @available(*, unavailable)
@@ -1065,6 +1069,8 @@ final class DockPreviewTrackingView: NSView {
     }
 
     private func checkInactivity() {
+        // 隐藏挂起中：不做任何事。
+        if DockPreviewPanel.shared.pendingHide { return }
         guard let window else { return }
         let currentMouseLocation = NSEvent.mouseLocation
         let windowFrame = window.frame.insetBy(dx: HoverContainerPadding.container, dy: HoverContainerPadding.container)
@@ -1074,9 +1080,8 @@ final class DockPreviewTrackingView: NSView {
         if windowFrame.contains(currentMouseLocation) || isMouseOverDockIcon {
             resetOpacityVisually()
         } else {
-            if fadeOutTimer == nil, window.alphaValue == 1.0 {
-                startFadeOut()
-            }
+            // 鼠标不在窗口内也不在图标上 → 直接隐藏。
+            startFadeOut()
         }
     }
 
@@ -1094,15 +1099,21 @@ final class DockPreviewTrackingView: NSView {
     }
 
     override func mouseEntered(with event: NSEvent) {
+        guard !isHiding else { return }
+        // 鼠标进入窗口：取消待定隐藏，窗口保持显示。
+        DockPreviewPanel.shared.cancelPendingHide()
+        mouseOutsideSince = nil
         resetOpacityVisually()
         DockPreviewPanel.shared.mouseIsWithinPreviewWindow = true
     }
 
     override func mouseExited(with event: NSEvent) {
+        guard !isHiding else { return }
         DockPreviewPanel.shared.mouseIsWithinPreviewWindow = false
     }
 
     private func startFadeOut() {
+        guard !isHiding else { return }
         DispatchQueue.main.async { [weak self] in
             guard let self,
                   let window,
@@ -1141,6 +1152,7 @@ final class DockPreviewTrackingView: NSView {
     }
 
     private func performHideWindow() {
-        DockPreviewPanel.shared.hideWindow()
+        isHiding = true
+        DockPreviewPanel.shared.hideWindow(animated: true)
     }
 }

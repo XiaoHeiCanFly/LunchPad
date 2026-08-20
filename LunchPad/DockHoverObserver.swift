@@ -153,6 +153,15 @@ final class DockHoverObserver {
         else {
             return
         }
+        let panel = DockPreviewPanel.shared
+        // 没有选中图标 → 启动隐藏定时器。
+        let appStatus = getDockItemAppStatusUnderMouse()
+        if case .notFound = appStatus.status {
+            if panel.isVisible { panel.schedulePendingHide() }
+            return
+        }
+        // 选中了图标 → 取消待定隐藏，展示预览。
+        panel.cancelPendingHide()
         let mouseLocation = DockHoverObserver.getMousePosition()
         showPreviewForHoveredDockApp(mouseLocation: mouseLocation, overrideDelay: false)
     }
@@ -162,14 +171,14 @@ final class DockHoverObserver {
         guard let dockItemElement = appUnderMouse.dockItemElement else { return }
         guard case let .success(currentApp) = appUnderMouse.status else { return }
 
-        // A preview is already showing for a different app and the pointer is
-        // inside it — ignore hover changes until the pointer leaves.
         let panel = DockPreviewPanel.shared
-        if panel.mouseIsWithinPreviewWindow,
-           let currentPID = panel.currentlyDisplayedPID,
-           currentApp.processIdentifier != currentPID
-        {
-            return
+        // 隐藏挂起中或窗口已展示：不重新触发（避免抖动）。
+        if panel.pendingHide || panel.isVisible {
+            // 但如果是不同 app，需要切换。
+            if let currentPID = panel.currentlyDisplayedPID,
+               currentApp.processIdentifier == currentPID {
+                return
+            }
         }
 
         // Group app instances in the dock (multiple copies of one app share

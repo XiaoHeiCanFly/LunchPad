@@ -28,6 +28,9 @@ final class DockPreviewPanel: NSPanel {
     var mouseIsWithinPreviewWindow: Bool = false
     private var onWindowTap: (() -> Void)?
     private var pendingShowWorkItem: DispatchWorkItem?
+    /// 鼠标移出图标后等待隐藏；期间抑制所有其他逻辑。
+    private(set) var pendingHide = false
+    private var pendingHideWorkItem: DispatchWorkItem?
 
     private var previousHoverWindowOrigin: CGPoint?
     private var currentDockPosition: DockPosition = .bottom
@@ -63,25 +66,73 @@ final class DockPreviewPanel: NSPanel {
         pendingShowWorkItem = nil
     }
 
-    func hideWindow(cancelPendingShow shouldCancelPendingShow: Bool = true) {
+    /// 鼠标移出图标后 0.15s 隐藏窗口。期间 `pendingHide` 为 true，抑制所有其他逻辑。
+    func schedulePendingHide() {
+        guard !pendingHide else { return }
+        pendingHide = true
+        pendingHideWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.pendingHide else { return }
+                self.pendingHide = false
+                self.hideWindow(animated: true)
+            }
+        }
+        pendingHideWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: work)
+    }
+
+    func cancelPendingHide() {
+        pendingHideWorkItem?.cancel()
+        pendingHideWorkItem = nil
+        pendingHide = false
+    }
+
+    func hideWindow(cancelPendingShow shouldCancelPendingShow: Bool = true, animated: Bool = false) {
         if shouldCancelPendingShow {
             cancelPendingShow()
         }
+        cancelPendingHide()
         guard isVisible else { return }
 
-        if let currentContent = contentView {
-            currentContent.removeFromSuperview()
+        let cleanup = { [weak self] in
+            guard let self else { return }
+            if let currentContent = contentView {
+                currentContent.removeFromSuperview()
+            }
+            contentView = nil
+            state.windows = []
+            state.selectionIndex = -1
+            onWindowTap = nil
+            currentlyDisplayedPID = nil
+            mouseIsWithinPreviewWindow = false
+            anchoredDockItem = nil
+            currentPreviewScreen = nil
+            Self.presentationFlag.set(false)
+            orderOut(nil)
         }
-        contentView = nil
-        state.windows = []
-        state.selectionIndex = -1
-        onWindowTap = nil
-        currentlyDisplayedPID = nil
-        mouseIsWithinPreviewWindow = false
-        anchoredDockItem = nil
-        currentPreviewScreen = nil
-        Self.presentationFlag.set(false)
-        orderOut(nil)
+
+        guard animated, Defaults.shared.showAnimations else {
+            cleanup()
+            return
+        }
+
+        // 消失动画：打开动画的反向（滑回 Dock）
+        let animationOffset: CGFloat = 7.0
+        var endFrame = frame
+        switch currentDockPosition {
+        case .bottom: endFrame.origin.y -= animationOffset
+        case .left:   endFrame.origin.x -= animationOffset
+        case .right:  endFrame.origin.x += animationOffset
+        default:      endFrame.origin.y -= animationOffset
+        }
+
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.175
+            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            self.animator().setFrame(endFrame, display: true)
+            self.animator().alphaValue = 0
+        }, completionHandler: cleanup)
     }
 
     /// Schedules a preview show after the hover delay, then re-validates the
@@ -480,7 +531,7 @@ final class DockPreviewPanel: NSPanel {
         }
 
         alphaValue = 1.0
-        makeKeyAndOrderFront(nil)
+        orderFront(nil)
     }
 
     // MARK: - Hit testing

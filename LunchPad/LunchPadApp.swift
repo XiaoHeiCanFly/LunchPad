@@ -135,16 +135,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // NSMenuEnableActionImages 控制（已实测确认）。
     @objc private func showPreferences() {
         NSApp.activate(ignoringOtherApps: true)
-        // The classic `showSettingsWindow:` hack no longer opens the SwiftUI
-        // Settings scene on macOS 26 — `sendAction` returns true but nothing
-        // happens. The scene is actually driven by the "Settings…" menu item
-        // that SwiftUI generates, so invoke that item directly.
+        // 尝试多种方式打开 Settings scene：
+        // 1. 通过 ⌘, 菜单项（最可靠）
+        // 2. 通过 showSettingsWindow: selector
+        // 3. 通过 "Settings"/"设置" 标题匹配已存在的窗口
         if let item = Self.settingsMenuItem(in: NSApp.mainMenu), let action = item.action {
             _ = NSApp.sendAction(action, to: item.target, from: nil)
         } else {
             _ = NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: self)
         }
-        LauncherController.shared.presentSettingsAboveLauncher()
+        // SwiftUI Settings scene 可能异步创建窗口，多帧重试。
+        let controller = LauncherController.shared
+        for delay in [0.0, 0.15, 0.35, 0.6] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                controller.presentSettingsAboveLauncher()
+            }
+        }
     }
 
     /// Recursively finds the "Settings…" menu item (⌘,) SwiftUI generates for

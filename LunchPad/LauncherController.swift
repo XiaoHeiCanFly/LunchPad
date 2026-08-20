@@ -860,14 +860,29 @@ final class LauncherController: ObservableObject {
     }
 
     func presentSettingsAboveLauncher() {
-        let promote = {
-            guard let w = NSApp.windows.first(where: { $0.isVisible && !($0 is LauncherPanel) && $0.styleMask.contains(.titled) })
-            else { return false }
-            w.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 2)
-            w.hidesOnDeactivate = true
-            NSApp.activate(ignoringOtherApps: true)
-            w.orderFront(nil); w.makeKeyAndOrderFront(nil)
-            return true
+        let promote = { () -> Bool in
+            // 优先找已可见的非 Launcher 窗口
+            if let w = NSApp.windows.first(where: { $0.isVisible && !($0 is LauncherPanel) && $0.styleMask.contains(.titled) }) {
+                w.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 2)
+                w.hidesOnDeactivate = true
+                NSApp.activate(ignoringOtherApps: true)
+                w.orderFront(nil); w.makeKeyAndOrderFront(nil)
+                return true
+            }
+            // 兜底：找标题含 "Settings"/"设置" 的窗口（可能尚未可见）
+            if let w = NSApp.windows.first(where: {
+                !$0.isVisible && !($0 is LauncherPanel) && $0.styleMask.contains(.titled)
+                    && ($0.title.localizedCaseInsensitiveContains("settings")
+                        || $0.title.localizedCaseInsensitiveContains("设置")
+                        || $0.title.contains("LunchPad"))
+            }) {
+                w.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 2)
+                w.hidesOnDeactivate = true
+                NSApp.activate(ignoringOtherApps: true)
+                w.orderFront(nil); w.makeKeyAndOrderFront(nil)
+                return true
+            }
+            return false
         }
         DispatchQueue.main.async {
             if !promote() { DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { _ = promote() } }
