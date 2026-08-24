@@ -364,6 +364,25 @@ private struct LauncherSettingsView: View {
                 }
                 Button("重新显示已隐藏的应用") { store.restoreHiddenApplications() }
             }
+            Section("诊断日志") {
+                LabeledContent("日志文件") {
+                    Text("launcher.log")
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+                HStack {
+                    Button("在访达中显示") { controller.revealDiagnosticLog() }
+                    Button("复制最近日志") { controller.copyDiagnosticLog() }
+                    Button("清除") { controller.clearDiagnosticLog() }
+                }
+                Text("自动记录打开触发、显示器选择、窗口创建、显示动画及延迟可见性检查。日志最多保留当前和上一次各 2 MB；再次出现打开后不显示时，直接复制最近日志即可。")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                Text(controller.diagnosticLogPath)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.tertiary)
+                    .textSelection(.enabled)
+            }
             Section {
                 Text("辅助功能权限用于优先拦截全局快捷键，并读取触控板四个原始触点。四指捏合的透明度与缩放会根据触点距离连续跟随手指。")
                     .font(.footnote)

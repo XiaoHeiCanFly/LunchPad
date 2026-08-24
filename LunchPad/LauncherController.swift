@@ -65,6 +65,10 @@ final class LauncherController: ObservableObject {
     /// Whether the user's last intent was to show (true) or hide (false).
     /// Set immediately on user action, before animation completes.
     private var showIntent = false
+    /// Identifies the latest presentation attempt so delayed visibility probes
+    /// never report stale state after a later show/hide operation.
+    private var presentationAttemptID = UUID()
+    private var lastDiagnosticsProgressBucket = -1
 
     // Thread-safe flag for the CGEvent tap (runs on a background thread).
     private let _isPresentedOnScreen = AtomicBool()
@@ -102,6 +106,8 @@ final class LauncherController: ObservableObject {
     // MARK: - Lifecycle
 
     func start(silently: Bool = false) {
+        LauncherDiagnostics.shared.startSession(silently: silently)
+        diagnosticRecord("lifecycle", "controller-start accessibility=\(AXIsProcessTrusted()) screens=\(NSScreen.screens.count)")
         applyDockIconPreference()
         installHotKey()
         installEventMonitors()
@@ -131,6 +137,7 @@ final class LauncherController: ObservableObject {
         ) { _ in
             Task { @MainActor in
                 let c = LauncherController.shared
+                c.diagnosticRecord("space", "active-space-changed presented=\(c.isPresented) panels=\(c.panels.count)")
                 if c.isPresented { c.hide(animated: false) }
             }
         }
@@ -151,6 +158,7 @@ final class LauncherController: ObservableObject {
     }
 
     func terminateImmediately() {
+        diagnosticRecord("lifecycle", "controller-terminate presented=\(isPresented) panels=\(panels.count)")
         store.stopObservingApplicationChanges()
         animator.stop()
         _isPresentedOnScreen.set(false)
@@ -180,14 +188,28 @@ final class LauncherController: ObservableObject {
     // MARK: - Show / Hide
 
     func show(animated: Bool = true) {
+        let attemptID = UUID()
+        presentationAttemptID = attemptID
+        lastDiagnosticsProgressBucket = -1
+        diagnosticRecord("presentation", "show-request id=\(attemptID.uuidString) animated=\(animated) presented=\(isPresented) intent=\(showIntent) progress=\(diagnosticNumber(animator.visualProgress)) panels=\(panels.count) frontmost=\(NSWorkspace.shared.frontmostApplication?.localizedName ?? "nil")")
         // The launcher and the Dock-hover preview never coexist.
         DockPreviewPanel.shared.hideWindow()
         showIntent = true
         // Defensive: if a drag was interrupted without ever reaching a drop,
         // make sure the launcher never reappears with a stuck dragged icon.
         store.endDrag()
-        guard !isPresented || animator.visualProgress < 0.99 else { return }
+        guard !isPresented || animator.visualProgress < 0.99 else {
+            diagnosticRecord("presentation", "show-skipped id=\(attemptID.uuidString) reason=already-presented \(diagnosticPanelsSummary())")
+            schedulePresentationProbes(for: attemptID)
+            return
+        }
         preparePresentationPanelsIfNeeded()
+        guard !panels.isEmpty else {
+            diagnosticRecord("error", "show-no-panels id=\(attemptID.uuidString) mode=\(displayMode) screens=\(NSScreen.screens.count)")
+            showIntent = false
+            setPresented(false)
+            return
+        }
         setPresented(true)
         setSpaceSwitchingHotKeysEnabled(true)
         store.optionIsPressed = NSEvent.modifierFlags.contains(.option)
@@ -212,9 +234,13 @@ final class LauncherController: ObservableObject {
         // key, so blank clicks would need two after a re-invoke. Make it key so
         // the first click always reaches the content view.
         panels.first?.makeKey()
+        diagnosticRecord("presentation", "show-ordered id=\(attemptID.uuidString) \(diagnosticPanelsSummary())")
+        schedulePresentationProbes(for: attemptID)
     }
 
     func hide(animated: Bool = true) {
+        presentationAttemptID = UUID()
+        diagnosticRecord("presentation", "hide-request animated=\(animated) presented=\(isPresented) progress=\(diagnosticNumber(animator.visualProgress)) panels=\(panels.count)")
         showIntent = false
         guard isPresented else { return }
         if animated {
@@ -248,9 +274,11 @@ final class LauncherController: ObservableObject {
             panel.orderOut(nil)
         }
         setSpaceSwitchingHotKeysEnabled(false)
+        diagnosticRecord("presentation", "hide-finished \(diagnosticPanelsSummary())")
     }
 
     func toggle() {
+        diagnosticRecord("presentation", "toggle intent=\(showIntent) presented=\(isPresented) progress=\(diagnosticNumber(animator.visualProgress))")
         showIntent ? hide() : show()
     }
 
@@ -258,6 +286,62 @@ final class LauncherController: ObservableObject {
 
     private var reduceMotion: Bool {
         UserDefaults.standard.bool(forKey: "reduceMotion")
+    }
+
+    // MARK: - Diagnostics
+
+    var diagnosticLogPath: String { LauncherDiagnostics.shared.logURL.path }
+
+    func revealDiagnosticLog() {
+        LauncherDiagnostics.shared.record("diagnostics", "reveal-log")
+        NSWorkspace.shared.activateFileViewerSelecting([LauncherDiagnostics.shared.logURL])
+    }
+
+    func copyDiagnosticLog() {
+        let text = LauncherDiagnostics.shared.readRecentText()
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text.isEmpty ? "暂无诊断日志" : text, forType: .string)
+        LauncherDiagnostics.shared.record("diagnostics", "copy-log bytes=\(text.utf8.count)")
+    }
+
+    func clearDiagnosticLog() {
+        LauncherDiagnostics.shared.clear()
+        LauncherDiagnostics.shared.record("diagnostics", "log-cleared")
+    }
+
+    private func diagnosticRecord(_ category: String, _ message: String) {
+        LauncherDiagnostics.shared.record(category, message)
+    }
+
+    private func diagnosticNumber(_ value: CGFloat) -> String {
+        String(format: "%.3f", Double(value))
+    }
+
+    private func diagnosticPanelsSummary() -> String {
+        guard !panels.isEmpty else { return "panels=[]" }
+        let summaries = panels.enumerated().map { index, panel in
+            let opacity = panel.contentView?.layer?.opacity ?? -1
+            return "#\(index){visible=\(panel.isVisible),key=\(panel.isKeyWindow),activeSpace=\(panel.isOnActiveSpace),occlusion=\(panel.occlusionState.rawValue),window=\(panel.windowNumber),level=\(panel.level.rawValue),alpha=\(diagnosticNumber(panel.alphaValue)),layerOpacity=\(diagnosticNumber(CGFloat(opacity))),frame=\(NSStringFromRect(panel.frame))}"
+        }
+        return "panels=[\(summaries.joined(separator: ","))]"
+    }
+
+    private func schedulePresentationProbes(for attemptID: UUID) {
+        for delay in [0.08, 0.35, 1.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, self.presentationAttemptID == attemptID else { return }
+                let visiblePanelCount = self.panels.filter(\.isVisible).count
+                let layerVisibleCount = self.panels.filter {
+                    ($0.contentView?.layer?.opacity ?? 0) > 0.02
+                }.count
+                let anomalous = self.isPresented && (visiblePanelCount == 0 || layerVisibleCount == 0)
+                self.diagnosticRecord(
+                    anomalous ? "error" : "probe",
+                    "show-probe id=\(attemptID.uuidString) delay=\(String(format: "%.2f", delay)) presented=\(self.isPresented) intent=\(self.showIntent) progress=\(self.diagnosticNumber(self.animator.visualProgress)) visiblePanels=\(visiblePanelCount) visibleLayers=\(layerVisibleCount) appActive=\(NSApp.isActive) \(self.diagnosticPanelsSummary())"
+                )
+            }
+        }
     }
 
     // MARK: - Gesture (animator-driven, no SwiftUI re-render)
@@ -305,14 +389,31 @@ final class LauncherController: ObservableObject {
             layer.opacity = Float(opacity)
             layer.transform = CATransform3DMakeScale(scale, scale, 1)
         }
+        let bucket = min(4, max(0, Int((min(1, max(0, progress)) * 4).rounded(.down))))
+        if bucket != lastDiagnosticsProgressBucket {
+            lastDiagnosticsProgressBucket = bucket
+            diagnosticRecord("animation", "progress=\(diagnosticNumber(progress)) scale=\(diagnosticNumber(scale)) opacity=\(diagnosticNumber(opacity)) panels=\(panels.count)")
+        }
     }
 
     /// Called once per gesture when the fingers have moved meaningfully.
     /// Presents the panels if the gesture is opening the launcher.
     private func prepareGesturePresentation() {
-        guard !isPresented else { return }
+        guard !isPresented else {
+            diagnosticRecord("gesture", "prepare-skipped reason=already-presented progress=\(diagnosticNumber(animator.visualProgress))")
+            return
+        }
+        let attemptID = UUID()
+        presentationAttemptID = attemptID
+        lastDiagnosticsProgressBucket = -1
+        diagnosticRecord("gesture", "prepare-presentation id=\(attemptID.uuidString) progress=\(diagnosticNumber(animator.visualProgress))")
         DockPreviewPanel.shared.hideWindow()
         preparePresentationPanelsIfNeeded()
+        guard !panels.isEmpty else {
+            diagnosticRecord("error", "gesture-no-panels id=\(attemptID.uuidString) mode=\(displayMode)")
+            isPinching = false
+            return
+        }
         setPresented(true)
         setSpaceSwitchingHotKeysEnabled(true)
         store.optionIsPressed = NSEvent.modifierFlags.contains(.option)
@@ -322,12 +423,18 @@ final class LauncherController: ObservableObject {
         // Re-assert after display (AppKit re-syncs layer geometry on order).
         applyVisualChange(animator.visualProgress)
         panels.first?.makeKey()
+        diagnosticRecord("gesture", "panels-ordered id=\(attemptID.uuidString) \(diagnosticPanelsSummary())")
+        schedulePresentationProbes(for: attemptID)
     }
 
     /// Main-thread entry point for a new four-finger contact (one hop per
     /// gesture from the raw-trackpad callback thread).
     func rawTrackpadGestureBegan() {
-        guard !animator.isTracking else { return }
+        guard !animator.isTracking else {
+            diagnosticRecord("gesture", "raw-begin-skipped reason=already-tracking")
+            return
+        }
+        diagnosticRecord("gesture", "raw-begin presented=\(isPresented) progress=\(diagnosticNumber(animator.visualProgress))")
         isPinching = true
         baseProgressForGesture = isPresented ? 1 : 0
         animator.beginTracking(base: baseProgressForGesture) { [weak self] in
@@ -352,6 +459,7 @@ final class LauncherController: ObservableObject {
     }
 
     private func handleSettleComplete(_ didOpen: Bool) {
+        diagnosticRecord("animation", "settle-complete opened=\(didOpen) progress=\(diagnosticNumber(animator.visualProgress)) \(diagnosticPanelsSummary())")
         isPinching = false
         if !didOpen {
             resetAndFinishHide()
@@ -755,6 +863,7 @@ final class LauncherController: ObservableObject {
     }
 
     private func rebuildPanels() {
+        diagnosticRecord("panel", "rebuild-start existing=\(panels.count) mode=\(displayMode) screens=\(NSScreen.screens.count)")
         panels.forEach { $0.close() }
         // Reset presented state so the next show()/toggle() starts clean.
         // Without this, unplugging the display that held the launcher leaves
@@ -767,7 +876,11 @@ final class LauncherController: ObservableObject {
         showIntent = false
         store.resetAdaptiveGrid()
         refreshDisplayOptions()
-        guard let screen = presentationScreen() else { panels = []; panelDisplayID = nil; return }
+        guard let screen = presentationScreen() else {
+            panels = []; panelDisplayID = nil
+            diagnosticRecord("error", "rebuild-no-screen")
+            return
+        }
         panelDisplayID = displayID(for: screen)
         // 拖拽指针约束到该显示器（CG 坐标：左上原点）。
         Self.dragConstraint.setFrame(screen.cgFrame)
@@ -812,12 +925,19 @@ final class LauncherController: ObservableObject {
         // only (see applyVisualChange), so anchorPoint/position/bounds are
         // left to AppKit — no per-panel anchor setup needed here.
         panels = [panel]
+        diagnosticRecord("panel", "rebuild-finished display=\(panelDisplayID ?? -1) screen=\(screen.localizedName) frame=\(NSStringFromRect(fullFrame)) visible=\(NSStringFromRect(screen.visibleFrame)) safe=\(screen.safeAreaInsets) panelLevel=\(panel.level.rawValue)")
         if isPresented { panels.forEach { $0.orderFront(nil) } }
     }
 
     private func preparePresentationPanelsIfNeeded() {
-        guard displayMode == "active", let screen = presentationScreen() else { return }
-        if panelDisplayID != displayID(for: screen) || panels.isEmpty { rebuildPanels() }
+        guard let screen = presentationScreen() else {
+            diagnosticRecord("error", "prepare-panels-no-screen mode=\(displayMode)")
+            return
+        }
+        let requestedDisplayID = displayID(for: screen)
+        let needsRebuild = panels.isEmpty || panelDisplayID != requestedDisplayID
+        diagnosticRecord("panel", "prepare mode=\(displayMode) requested=\(requestedDisplayID) current=\(panelDisplayID ?? -1) panels=\(panels.count) rebuild=\(needsRebuild)")
+        if needsRebuild { rebuildPanels() }
     }
 
     private var displayMode: String { UserDefaults.standard.string(forKey: "display-mode") ?? "active" }
