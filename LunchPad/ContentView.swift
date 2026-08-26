@@ -787,6 +787,39 @@ struct LauncherBackdrop: View {
     }
 }
 
+/// Pixel-aligned crop of the full-screen launcher backdrop for the small panel
+/// that covers the system menu bar. Shifting the same full-size backdrop down
+/// aligns its top edge with the display before this view clips the remainder.
+struct LauncherMenuBarCoverView: View {
+    let wallpaperURL: URL?
+    let screenSize: CGSize
+    let coverHeight: CGFloat
+
+    @EnvironmentObject private var controller: LauncherController
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @AppStorage("background-blur-radius") private var backgroundBlurRadius = 34.0
+
+    var body: some View {
+        ZStack {
+            LauncherBackdrop(
+                reduceTransparency: reduceTransparency,
+                wallpaperURL: wallpaperURL,
+                screenSize: screenSize,
+                blurRadius: backgroundBlurRadius
+            )
+            .frame(width: screenSize.width, height: screenSize.height)
+            .offset(y: max(0, screenSize.height - coverHeight) / 2)
+
+            Color.clear
+                .contentShape(Rectangle())
+                .onTapGesture { controller.hide() }
+        }
+        .frame(width: screenSize.width, height: coverHeight)
+        .clipped()
+        .preferredColorScheme(.dark)
+    }
+}
+
 /// Right-click menu item model for `BlankAreaCatcher`. A `nil` title with no
 /// action or submenu renders as a separator.
 private struct ContextMenuItem {

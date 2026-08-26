@@ -924,7 +924,37 @@ final class LauncherController: ObservableObject {
         // Scaling is pivoted around the screen center via `layer.transform`
         // only (see applyVisualChange), so anchorPoint/position/bounds are
         // left to AppKit — no per-panel anchor setup needed here.
-        panels = [panel]
+        // The main launcher remains below the Dock. A tightly bounded second
+        // panel covers only the menu-bar rectangle at a higher level; it uses
+        // the same backdrop source and animation transform, so the Dock stays
+        // visible without introducing an independently colored strip.
+        let menuCoverHeight = max(menuBarH, safe.top)
+        var builtPanels: [LauncherPanel] = [panel]
+        if menuCoverHeight > 0 {
+            let coverFrame = NSRect(
+                x: fullFrame.minX,
+                y: fullFrame.maxY - menuCoverHeight,
+                width: fullFrame.width,
+                height: menuCoverHeight
+            )
+            let coverRoot = LauncherMenuBarCoverView(
+                wallpaperURL: wallpaperURL,
+                screenSize: fullFrame.size,
+                coverHeight: menuCoverHeight
+            )
+            .environmentObject(self)
+            .frame(width: coverFrame.width, height: coverFrame.height)
+            let coverHostingView = NSHostingView(rootView: coverRoot)
+            coverHostingView.frame = NSRect(origin: .zero, size: coverFrame.size)
+            coverHostingView.autoresizingMask = [.width, .height]
+            coverHostingView.wantsLayer = true
+            let coverPanel = LauncherMenuBarCoverPanel(contentRect: coverFrame)
+            coverPanel.contentView = coverHostingView
+            coverPanel.setFrame(coverFrame, display: false)
+            coverPanel.targetFullFrame = coverFrame
+            builtPanels.append(coverPanel)
+        }
+        panels = builtPanels
         diagnosticRecord("panel", "rebuild-finished display=\(panelDisplayID ?? -1) screen=\(screen.localizedName) frame=\(NSStringFromRect(fullFrame)) visible=\(NSStringFromRect(screen.visibleFrame)) safe=\(screen.safeAreaInsets) panelLevel=\(panel.level.rawValue)")
         if isPresented { panels.forEach { $0.orderFront(nil) } }
     }
@@ -1303,6 +1333,18 @@ private class LauncherPanel: NSPanel {
             width: w, height: h
         )
     }
+}
+
+/// Covers only the menu-bar rectangle. Its frame never intersects the Dock,
+/// so it can sit above the menu bar without hiding or blocking the Dock.
+private final class LauncherMenuBarCoverPanel: LauncherPanel {
+    override init(contentRect: NSRect) {
+        super.init(contentRect: contentRect)
+        level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 1)
+        acceptsMouseMovedEvents = false
+    }
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
 }
 
 private final class UninstallDimmingPanel: NSPanel {
