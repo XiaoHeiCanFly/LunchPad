@@ -882,6 +882,10 @@ final class LauncherController: ObservableObject {
             return
         }
         panelDisplayID = displayID(for: screen)
+        let displayLinkRetargeted = animator.retarget(on: screen)
+        if displayLinkRetargeted {
+            diagnosticRecord("animation", "display-link-retargeted display=\(panelDisplayID ?? -1) screen=\(screen.localizedName)")
+        }
         // 拖拽指针约束到该显示器（CG 坐标：左上原点）。
         Self.dragConstraint.setFrame(screen.cgFrame)
         let dockL = max(0, screen.visibleFrame.minX - screen.frame.minX)

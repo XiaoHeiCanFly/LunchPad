@@ -67,6 +67,14 @@ final class LauncherGestureAnimator {
 
     /// Maximum time a settle may run before it is forced to finish.
     static let maxSettleDuration: TimeInterval = 1.1
+    /// Raw MultitouchSupport occasionally misses the final contact frame
+    /// (sleep/wake and display reconfiguration are the common cases). Never
+    /// allow that stale contact to own the animator indefinitely.
+    static let maxTrackingDuration: TimeInterval = 5
+    /// A CADisplayLink tied to a display that went away can remain non-nil but
+    /// stop delivering frames. Detect that case without delaying an explicit
+    /// launcher invocation by seconds.
+    static let firstFrameWatchdogDelay: TimeInterval = 0.12
 
     // MARK: - Wiring (set by LauncherController)
 
@@ -81,6 +89,9 @@ final class LauncherGestureAnimator {
     // MARK: - Private state
 
     private var displayLink: CADisplayLink?
+    /// The physical display the current CADisplayLink was created from. A
+    /// display link does not migrate when that display is unplugged.
+    private var displayID: Int?
     private var baseProgress: CGFloat = 0
     /// Farthest targets (raw, unfiltered) the fingers reached during tracking.
     /// Used at release to judge gesture direction without the low-pass lag.
@@ -95,31 +106,46 @@ final class LauncherGestureAnimator {
     private var settleStartTime: Date = .distantPast
     private var didBeginGesture = false
     private var settleTarget: CGFloat = 0
+    /// Invalidates delayed watchdog work whenever a newer transition starts.
+    private var transitionGeneration: UInt = 0
 
     // MARK: - Lifecycle
 
     func start(on screen: NSScreen?) {
-        guard displayLink == nil else { return }
-        let link: CADisplayLink
-        if let screen {
-            link = screen.displayLink(target: self, selector: #selector(tick(_:)))
-        } else if let main = NSScreen.main {
-            link = main.displayLink(target: self, selector: #selector(tick(_:)))
-        } else {
-            return
-        }
+        _ = retarget(on: screen)
+    }
+
+    /// Recreates the display link when the presentation display changes.
+    /// `CADisplayLink` remains tied to the NSScreen that created it; retaining
+    /// the old object after unplugging an external monitor leaves a valid,
+    /// non-nil link that never emits another frame.
+    @discardableResult
+    func retarget(on requestedScreen: NSScreen?) -> Bool {
+        guard let screen = requestedScreen ?? NSScreen.main else { return false }
+        let requestedID = Self.identifier(for: screen)
+        guard displayLink == nil || displayID != requestedID else { return false }
+
+        let shouldRun = state != .idle
+        displayLink?.invalidate()
+        let link = screen.displayLink(target: self, selector: #selector(tick(_:)))
         link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
         link.add(to: .main, forMode: .common)
-        link.isPaused = true
+        link.isPaused = !shouldRun
         displayLink = link
+        displayID = requestedID
+        return true
     }
 
     func stop() {
+        cancelTransition()
         displayLink?.invalidate()
         displayLink = nil
-        state = .idle
-        trackingTargetProvider = nil
-        trackingContactActive = nil
+        displayID = nil
+    }
+
+    private static func identifier(for screen: NSScreen) -> Int {
+        (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.intValue
+            ?? screen.hashValue
     }
 
     // MARK: - Gesture API
@@ -139,6 +165,16 @@ final class LauncherGestureAnimator {
         didBeginGesture = false
         state = .tracking
         resumeLink()
+        let generation = transitionGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.maxTrackingDuration) { [weak self] in
+            guard let self,
+                  self.transitionGeneration == generation,
+                  self.state == .tracking else { return }
+            // Treat an abnormally long raw contact as released. endTracking()
+            // retains the normal threshold/direction decision, so recovery is
+            // visually identical to lifting the fingers.
+            self.endTracking()
+        }
     }
 
     /// Called when the fingers lift. Judged by how far the raw target moved:
@@ -175,6 +211,29 @@ final class LauncherGestureAnimator {
         settleStartTime = Date()
         state = .settling(target: target)
         resumeLink()
+        let generation = transitionGeneration
+        let startingProgress = visualProgress
+
+        // CADisplayLink may silently stop after a display/Space lifecycle
+        // change. If not even the first frame arrives, complete immediately so
+        // the ordered panels cannot remain fully transparent.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.firstFrameWatchdogDelay) { [weak self] in
+            guard let self,
+                  self.transitionGeneration == generation,
+                  self.state == .settling(target: target),
+                  abs(self.visualProgress - startingProgress) < 0.0001 else { return }
+            self.finishSettling()
+        }
+
+        // The frame-based timeout cannot fire when the display link itself is
+        // stalled, so keep an independent main-run-loop deadline as a second
+        // line of defence.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.maxSettleDuration) { [weak self] in
+            guard let self,
+                  self.transitionGeneration == generation,
+                  self.state == .settling(target: target) else { return }
+            self.finishSettling()
+        }
     }
 
     /// Non-gesture instant jump.
@@ -242,6 +301,7 @@ final class LauncherGestureAnimator {
         visualProgress = settleTarget
         velocity = 0
         state = .idle
+        transitionGeneration &+= 1
         trackingTargetProvider = nil
         trackingContactActive = nil
         pauseLink()
@@ -250,6 +310,7 @@ final class LauncherGestureAnimator {
     }
 
     private func cancelTransition() {
+        transitionGeneration &+= 1
         state = .idle
         trackingTargetProvider = nil
         trackingContactActive = nil
