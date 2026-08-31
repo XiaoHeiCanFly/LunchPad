@@ -22,7 +22,10 @@ final class DockPreviewState: ObservableObject {
 final class DockPreviewPanel: NSPanel {
     static let shared = DockPreviewPanel()
 
-    let state = DockPreviewState()
+    /// Replaced atomically when a preview is dismissed. Keeping the retired
+    /// state alive briefly lets the launcher paint its first frames before the
+    /// potentially large window-image graph is released.
+    private(set) var state = DockPreviewState()
 
     private(set) var currentlyDisplayedPID: pid_t?
     var mouseIsWithinPreviewWindow: Bool = false
@@ -97,19 +100,30 @@ final class DockPreviewPanel: NSPanel {
 
         let cleanup = { [weak self] in
             guard let self else { return }
-            if let currentContent = contentView {
-                currentContent.removeFromSuperview()
-            }
+            // Make the preview disappear before touching its SwiftUI/image
+            // graph. Clearing state.windows and destroying NSHostingView used
+            // to happen synchronously here, blocking launcher activation for
+            // hundreds of milliseconds when many snapshots were displayed.
+            Self.presentationFlag.set(false)
+            orderOut(nil)
+
+            let retiredContentView = contentView
+            let retiredState = state
+            state = DockPreviewState()
             contentView = nil
-            state.windows = []
-            state.selectionIndex = -1
             onWindowTap = nil
             currentlyDisplayedPID = nil
             mouseIsWithinPreviewWindow = false
             anchoredDockItem = nil
             currentPreviewScreen = nil
-            Self.presentationFlag.set(false)
-            orderOut(nil)
+
+            // Retire the detached view after the launcher's ~0.35s transition
+            // has completed. The closure deliberately owns both objects so
+            // their images/views cannot deallocate on the activation path.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) {
+                withExtendedLifetime(retiredContentView) {}
+                withExtendedLifetime(retiredState) {}
+            }
         }
 
         guard animated, Defaults.shared.showAnimations else {

@@ -23,6 +23,13 @@ nonisolated final class TrackpadContactState: @unchecked Sendable {
     private var latestRadius: CGFloat = 0
     private var contactIsActive = false
     private var needsWakeup = false
+    private var lastFourFingerFrameUptime: TimeInterval = 0
+
+    /// MultitouchSupport briefly reports 3/5 contacts while four fingers are
+    /// landing or lifting. Ending on the first such frame makes a valid pinch
+    /// close again within one display tick. Preserve the contact across a few
+    /// sensor frames, while keeping release latency below a tenth of a second.
+    private static let contactLossGrace: TimeInterval = 0.075
 
     /// Total radius change since the contact began (startRadius − latest).
     /// Positive = fingers moving together, negative = spreading.
@@ -34,6 +41,7 @@ nonisolated final class TrackpadContactState: @unchecked Sendable {
 
     var contactActive: Bool {
         lock.lock(); defer { lock.unlock() }
+        expireContactIfNeededLocked(now: ProcessInfo.processInfo.systemUptime)
         return contactIsActive
     }
 
@@ -49,6 +57,8 @@ nonisolated final class TrackpadContactState: @unchecked Sendable {
 
     func updateContact(radius: CGFloat) {
         lock.lock()
+        let now = ProcessInfo.processInfo.systemUptime
+        expireContactIfNeededLocked(now: now)
         if !contactIsActive {
             // Transition into a new contact: record the baseline.
             contactIsActive = true
@@ -58,15 +68,25 @@ nonisolated final class TrackpadContactState: @unchecked Sendable {
         } else {
             latestRadius = radius
         }
+        lastFourFingerFrameUptime = now
         lock.unlock()
     }
 
     func endContact() {
         lock.lock()
+        // Do not tear down on a single noisy non-four-finger frame. Repeated
+        // frames, or the animator's next contactActive poll, expire it after
+        // the short grace period above.
+        expireContactIfNeededLocked(now: ProcessInfo.processInfo.systemUptime)
+        lock.unlock()
+    }
+
+    private func expireContactIfNeededLocked(now: TimeInterval) {
+        guard contactIsActive,
+              now - lastFourFingerFrameUptime > Self.contactLossGrace else { return }
         contactIsActive = false
         startRadius = nil
         latestRadius = 0
-        lock.unlock()
     }
 }
 

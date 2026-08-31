@@ -48,6 +48,9 @@ final class DockHoverObserver {
 
     private var eventTap: CFMachPort?
     private var eventTapRunLoopSource: CFRunLoopSource?
+    /// Window discovery/capture can outlive the hover that started it. Keep a
+    /// handle so launcher activation can cancel that work immediately.
+    private var windowFetchTask: Task<Void, Never>?
 
     // MARK: - Lifecycle
 
@@ -60,6 +63,8 @@ final class DockHoverObserver {
     }
 
     func stop() {
+        windowFetchTask?.cancel()
+        windowFetchTask = nil
         healthCheckTimer?.invalidate()
         healthCheckTimer = nil
         teardownObserver()
@@ -195,7 +200,8 @@ final class DockHoverObserver {
         let convertedMouseLocation = DockHoverObserver.nsPointFromCGPoint(mouseLocation, forScreen: mouseScreen)
         let appName = currentApp.localizedName ?? "Unknown"
 
-        Task { [weak self] in
+        windowFetchTask?.cancel()
+        windowFetchTask = Task { [weak self] in
             var windows: [PreviewWindow] = []
             do {
                 for appInstance in appsToFetchWindowsFrom {
@@ -208,6 +214,7 @@ final class DockHoverObserver {
 
             await MainActor.run { [weak self] in
                 guard let self else { return }
+                guard !LauncherController.shared.isPresented else { return }
                 // Final validation: the pointer must still hover the same app.
                 guard case let .success(stillHoveredApp) = getDockItemAppStatusUnderMouse().status,
                       stillHoveredApp.processIdentifier == currentApp.processIdentifier
@@ -248,6 +255,15 @@ final class DockHoverObserver {
     }
 
     func hideWindowAndResetLastApp() {
+        DockPreviewPanel.shared.hideWindow()
+    }
+
+    /// Ends every preview pipeline before the launcher begins presenting.
+    /// This is intentionally lightweight: the panel orders out immediately
+    /// and releases its SwiftUI/image graph after the launcher transition.
+    func prepareForLauncherPresentation() {
+        windowFetchTask?.cancel()
+        windowFetchTask = nil
         DockPreviewPanel.shared.hideWindow()
     }
 

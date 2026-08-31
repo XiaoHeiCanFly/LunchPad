@@ -193,7 +193,7 @@ final class LauncherController: ObservableObject {
         lastDiagnosticsProgressBucket = -1
         diagnosticRecord("presentation", "show-request id=\(attemptID.uuidString) animated=\(animated) presented=\(isPresented) intent=\(showIntent) progress=\(diagnosticNumber(animator.visualProgress)) panels=\(panels.count) frontmost=\(NSWorkspace.shared.frontmostApplication?.localizedName ?? "nil")")
         // The launcher and the Dock-hover preview never coexist.
-        DockPreviewPanel.shared.hideWindow()
+        DockHoverObserver.shared.prepareForLauncherPresentation()
         showIntent = true
         // Defensive: if a drag was interrupted without ever reaching a drop,
         // make sure the launcher never reappears with a stuck dragged icon.
@@ -407,7 +407,7 @@ final class LauncherController: ObservableObject {
         presentationAttemptID = attemptID
         lastDiagnosticsProgressBucket = -1
         diagnosticRecord("gesture", "prepare-presentation id=\(attemptID.uuidString) progress=\(diagnosticNumber(animator.visualProgress))")
-        DockPreviewPanel.shared.hideWindow()
+        DockHoverObserver.shared.prepareForLauncherPresentation()
         preparePresentationPanelsIfNeeded()
         guard !panels.isEmpty else {
             diagnosticRecord("error", "gesture-no-panels id=\(attemptID.uuidString) mode=\(displayMode)")
