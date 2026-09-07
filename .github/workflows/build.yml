@@ -6,6 +6,12 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'DMG version (MAJOR.MINOR.PATCH, without v)'
+        required: true
+        default: '0.0.1'
+        type: string
 
 permissions:
   contents: read
@@ -19,7 +25,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
 
@@ -42,6 +48,8 @@ jobs:
           BUILD_REF_TYPE: ${{ github.ref_type }}
           BUILD_REF_NAME: ${{ github.ref_name }}
           BUILD_NUMBER: ${{ github.run_number }}
+          MANUAL_VERSION: ${{ inputs.version }}
+          BUILD_EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
           version_args=("CURRENT_PROJECT_VERSION=$BUILD_NUMBER")
@@ -51,6 +59,11 @@ jobs:
               exit 1
             fi
             version_args+=("MARKETING_VERSION=${BASH_REMATCH[1]}")
+          elif [[ "$BUILD_EVENT" == workflow_dispatch ]]; then
+            [[ "$MANUAL_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+              echo 'Version must use MAJOR.MINOR.PATCH.' >&2; exit 1;
+            }
+            version_args+=("MARKETING_VERSION=$MANUAL_VERSION")
           fi
           xcodebuild \
             -project LunchPad.xcodeproj -scheme LunchPad \
@@ -70,16 +83,31 @@ jobs:
 
       - name: Upload packages
         if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: LunchPad-packages
           path: ${{ runner.temp }}/LunchPad-dist/*
           if-no-files-found: error
           retention-days: 14
 
+      - name: Explain build outputs
+        if: success()
+        shell: bash
+        env:
+          BUILD_EVENT: ${{ github.event_name }}
+          BUILD_REF_TYPE: ${{ github.ref_type }}
+        run: |
+          if [[ "$BUILD_EVENT" == workflow_dispatch || "$BUILD_REF_TYPE" == tag ]]; then
+            echo '### DMG 打包完成' >> "$GITHUB_STEP_SUMMARY"
+            echo '下载下方 Artifacts 中的 **LunchPad-packages**，解压后包含 DMG、源码和校验文件。LunchPad-build-log 仅为日志。' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '### 编译检查通过（本次未打包）' >> "$GITHUB_STEP_SUMMARY"
+            echo '需要 DMG：进入工作流页面 → Run workflow → 填写 version → 运行，或推送版本标签。' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Upload build log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: LunchPad-build-log
           path: ${{ runner.temp }}/LunchPad-build.log
@@ -94,7 +122,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: LunchPad-packages
           path: dist

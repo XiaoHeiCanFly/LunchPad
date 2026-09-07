@@ -41,7 +41,7 @@
 工作流：`.github/workflows/build.yml`。推送这些配置到 GitHub 后生效，无需配置个人 Token 或证书。
 
 - 推送 `main` 或提交 PR：在 `macos-26` 上编译 Release 通用应用（arm64 + x86_64）。
-- GitHub → Actions → **Build and package macOS** → **Run workflow**：编译并打包，在运行结果的 **Artifacts → LunchPad-packages** 下载 DMG、源码和校验文件；不会创建 Release。
+- GitHub → Actions → **Build and package macOS** → **Run workflow**：选择 `main`，填写 `version`（例如 `0.0.1`），编译并打包，在运行结果的 **Artifacts → LunchPad-packages** 下载 DMG、源码和校验文件；不会创建 Release。`LunchPad-build-log` 仅为日志，普通 main/PR 编译检查不会生成 DMG。
 - 推送 `v主版本.次版本.补丁版本` 标签：构建成功后自动发布 GitHub Release，附带 DMG、对应提交的源码归档和 SHA-256 校验文件。例如：
 
 ```bash
