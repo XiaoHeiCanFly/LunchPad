@@ -36,6 +36,33 @@
 
 首次使用全局触控板手势时，在 LunchPad 设置中授予“辅助功能”权限。LunchPad 会实时检查授权结果；F4 的 Carbon 全局热键不依赖该权限。
 
+## GitHub 自动构建与发布
+
+工作流：`.github/workflows/build.yml`。推送这些配置到 GitHub 后生效，无需配置个人 Token 或证书。
+
+- 推送 `main` 或提交 PR：在 `macos-26` 上编译 Release 通用应用（arm64 + x86_64）。
+- GitHub → Actions → **Build and package macOS** → **Run workflow**：编译并打包，在运行结果的 **Artifacts → LunchPad-packages** 下载 DMG、源码和校验文件；不会创建 Release。
+- 推送 `v主版本.次版本.补丁版本` 标签：构建成功后自动发布 GitHub Release，附带 DMG、对应提交的源码归档和 SHA-256 校验文件。例如：
+
+```bash
+git tag v1.0.1
+git push github v1.0.1
+```
+
+标签版本自动写入应用版本号，构建号取 Actions 的运行序号。只支持正式版本标签，例如 `v1.0.1`；不支持 `v1.0.1-beta`。请确认标签指向已经包含工作流的提交。已公开的 Release 不会被覆盖，需要使用新版本标签；发布中断留下的草稿可通过重新运行工作流继续上传。
+
+构建使用运行器自带的 Xcode，启动时检查 SDK 至少为 macOS 26.5，不降低项目部署目标。运行器配置参考 [GitHub 官方 macOS 镜像说明](https://github.com/actions/runner-images/blob/main/images/macos/macos-26-arm64-Readme.md)。PR 和构建任务只有仓库读取权限，仅标签发布任务获得 `contents: write`。
+
+当前是**无开发者证书构建**：仅在打包副本上进行 ad-hoc 签名，未做 Developer ID 签名、公证或 stapling。Gatekeeper 可能拦截，权限授权及登录项仍需实机确认，详见 [安装说明](docs/UNSIGNED-BUILD.md)。未来接入证书时，使用 GitHub Secrets 保存证书和公证凭据，不应提交到仓库。
+
+本地打包已编译的通用应用：
+
+```bash
+bash scripts/package-dmg.sh /path/to/LunchPad.app /path/to/output
+```
+
+打包脚本不会覆盖已有产物，也不会改动输入的应用；源码归档来自当前 Git `HEAD`，因此本地正式打包前应先提交代码，并用同一提交构建应用。
+
 ## 系统 API 边界
 
 辅助功能授权后，LunchPad 可在其他应用处于前台时通过全局 `NSEvent` 监视器接收捏合进度和 Option 键状态。公开事件提供连续的 magnification 与 phase，但不提供触点数量，因此具体手指数仍由系统触控板映射决定。项目没有使用私有 MultitouchSupport API，便于后续签名、公证和分发。

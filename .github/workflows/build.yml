@@ -1,0 +1,119 @@
+name: Build and package macOS
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check Xcode and SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          sdk_version="$(xcrun --sdk macosx --show-sdk-version)"
+          python3 - "$sdk_version" <<'PY'
+          import sys
+          version = tuple(int(part) for part in sys.argv[1].split('.'))
+          if version < (26, 5):
+              raise SystemExit('LunchPad requires the macOS 26.5 SDK or newer.')
+          PY
+
+      - name: Build universal app
+        shell: bash
+        env:
+          BUILD_REF_TYPE: ${{ github.ref_type }}
+          BUILD_REF_NAME: ${{ github.ref_name }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          version_args=("CURRENT_PROJECT_VERSION=$BUILD_NUMBER")
+          if [[ "$BUILD_REF_TYPE" == tag ]]; then
+            if [[ ! "$BUILD_REF_NAME" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+              echo 'Release tags must use vMAJOR.MINOR.PATCH, for example v1.0.1.' >&2
+              exit 1
+            fi
+            version_args+=("MARKETING_VERSION=${BASH_REMATCH[1]}")
+          fi
+          xcodebuild \
+            -project LunchPad.xcodeproj -scheme LunchPad \
+            -configuration Release -destination 'generic/platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/LunchPadBuild" \
+            ARCHS='arm64 x86_64' ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            "${version_args[@]}" build 2>&1 | tee "$RUNNER_TEMP/LunchPad-build.log"
+
+      - name: Package DMG and source archive
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          bash scripts/package-dmg.sh \
+            "$RUNNER_TEMP/LunchPadBuild/Build/Products/Release/LunchPad.app" \
+            "$RUNNER_TEMP/LunchPad-dist"
+
+      - name: Upload packages
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: LunchPad-packages
+          path: ${{ runner.temp }}/LunchPad-dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LunchPad-build-log
+          path: ${{ runner.temp }}/LunchPad-build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: LunchPad-packages
+          path: dist
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            # Permit retrying a failed upload, but never replace a public release.
+            is_draft="$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)"
+            [[ "$is_draft" == true ]] || { echo 'Release already published; use a new version tag.' >&2; exit 1; }
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft \
+              --title "LunchPad $RELEASE_TAG" --generate-notes \
+              --notes 'macOS 26.5+，Apple Silicon / Intel 通用包。此构建仅有本地 ad-hoc 签名，未经过 Apple Developer ID 签名或公证，安装时可能受到 Gatekeeper 拦截，登录项等功能需另行验证。附带对应源码及 SHA-256 校验文件。'
+          fi
+          gh release upload "$RELEASE_TAG" dist/* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false
