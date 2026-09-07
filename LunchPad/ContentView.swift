@@ -313,6 +313,8 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 HStack {
                     SearchField(
+                        animation: controller.searchAnimation,
+                        screenHeight: screenSize.height,
                         text: $store.searchText,
                         isFocused: $searchFocused,
                         onSubmit: {
@@ -909,12 +911,16 @@ private struct BlankAreaCatcher: NSViewRepresentable {
 }
 
 private struct SearchField: View {
+    @ObservedObject var animation: LauncherSearchAnimation
+    let screenHeight: CGFloat
     @Binding var text: String
     let isFocused: FocusState<Bool>.Binding
     let onSubmit: () -> Void
     let onSettings: () -> Void
 
     var body: some View {
+        let launcherScale = animation.scale
+        let screenCenterY = screenHeight / 2
         HStack(spacing: 9) {
             Image(systemName: "magnifyingglass")
                 .foregroundStyle(.white.opacity(0.72))
@@ -948,6 +954,16 @@ private struct SearchField: View {
         .padding(.horizontal, 15)
         .frame(height: 42)
         .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .visualEffect { content, geometry in
+            // The enclosing AppKit layer scales around the screen centre.
+            // Counter that transform for search only, keeping its normal top
+            // inset and size throughout opening, closing and reversed pinches.
+            // Geometry is the untransformed SwiftUI layout in window space.
+            let top = geometry.frame(in: .global).minY
+            return content
+                .scaleEffect(1 / launcherScale, anchor: .top)
+                .offset(y: (screenCenterY - top) * (1 - 1 / launcherScale))
+        }
     }
 }
 

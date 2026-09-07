@@ -12,9 +12,16 @@ struct LauncherDisplayOption: Identifiable, Hashable {
     let name: String
 }
 
+/// Only the search field observes this state, not the application grid.
+@MainActor
+final class LauncherSearchAnimation: ObservableObject {
+    @Published var scale: CGFloat = 1
+}
+
 @MainActor
 final class LauncherController: ObservableObject {
     static let shared = LauncherController()
+    let searchAnimation = LauncherSearchAnimation()
 
     @Published private(set) var isPresented = false
     @Published private(set) var accessibilityPermissionGranted = false
@@ -346,9 +353,8 @@ final class LauncherController: ObservableObject {
 
     // MARK: - Gesture (animator-driven, no SwiftUI re-render)
 
-    /// Apply the current gesture progress to every panel's layer. This mutates
-    /// CALayer properties only — no @Published change, so the SwiftUI view
-    /// tree is never re-evaluated during a gesture.
+    /// Animate panel layers directly. Only the search field observes the small
+    /// counter-scale state; the application grid is not invalidated per frame.
     private func applyVisualChange(_ progress: CGFloat) {
         let scale: CGFloat
         let opacity: CGFloat
@@ -370,9 +376,38 @@ final class LauncherController: ObservableObject {
             opacity = min(1, max(0, (p - 0.05) / 0.5))
         }
         let center = presentationScreenCenter
+        if searchAnimation.scale != scale { searchAnimation.scale = scale }
+        let menuCoverFrame = panels.first(where: { $0 is LauncherMenuBarCoverPanel })?.targetFullFrame
+        // The display link supplies every animation frame. Do not let Core
+        // Animation add independent interpolation to the menu-bar cover.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
         for panel in panels {
             guard let layer = panel.contentView?.layer else { continue }
             let f = panel.targetFullFrame
+            if panel is LauncherMenuBarCoverPanel {
+                // Keep the crop fixed at the menu bar. It shares the main
+                // panel's exact visibility threshold and fade curve, but not
+                // its screen-centred scale (which made this strip slide in).
+                layer.anchorPoint = .zero
+                layer.position = .zero
+                layer.bounds = CGRect(origin: .zero, size: f.size)
+                layer.transform = CATransform3DIdentity
+                layer.opacity = Float(opacity)
+                // Scale the full wallpaper INSIDE a stationary viewport.
+                // Scaling a pre-cropped strip moves its edges; not scaling
+                // its pixels at all makes the wallpaper discontinuous below.
+                if let viewport = panel.contentView as? LauncherMenuBarViewport,
+                   let wallpaperLayer = viewport.wallpaperView.layer {
+                    let size = viewport.wallpaperView.bounds.size
+                    wallpaperLayer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+                    wallpaperLayer.position = CGPoint(x: size.width / 2, y: size.height / 2)
+                    wallpaperLayer.bounds = CGRect(origin: .zero, size: size)
+                    wallpaperLayer.transform = CATransform3DMakeScale(scale, scale, 1)
+                }
+                continue
+            }
             // Pin the layer's anchor to the shared screen center. Re-asserted
             // every frame because AppKit sets a window content layer's anchor
             // to (0,0) — with that default, a plain scale grows from the
@@ -388,6 +423,29 @@ final class LauncherController: ObservableObject {
             layer.bounds = CGRect(origin: .zero, size: f.size)
             layer.opacity = Float(opacity)
             layer.transform = CATransform3DMakeScale(scale, scale, 1)
+            if let menuCoverFrame, f.intersects(menuCoverFrame) {
+                // Do not fade two wallpaper surfaces over the menu bar.
+                // Two layers at alpha a produce 1-(1-a)^2 there, making the
+                // cover appear opaque sooner than the rest of the launcher.
+                // Keep this cut at the fixed screen boundary by undoing the
+                // main layer's scale when expressing it in local coordinates.
+                let flipped = panel.contentView?.isFlipped == true
+                let boundary = flipped
+                    ? f.maxY - menuCoverFrame.minY
+                    : menuCoverFrame.minY - f.minY
+                let localBoundary = min(f.height, max(0,
+                    pivot.y + (boundary - pivot.y) / scale))
+                let visibleRect = flipped
+                    ? CGRect(x: 0, y: localBoundary, width: f.width,
+                             height: f.height - localBoundary)
+                    : CGRect(x: 0, y: 0, width: f.width, height: localBoundary)
+                let contentMask = layer.mask ?? CALayer()
+                contentMask.backgroundColor = NSColor.black.cgColor
+                contentMask.frame = visibleRect
+                if layer.mask == nil { layer.mask = contentMask }
+            } else {
+                layer.mask = nil
+            }
         }
         let bucket = min(4, max(0, Int((min(1, max(0, progress)) * 4).rounded(.down))))
         if bucket != lastDiagnosticsProgressBucket {
@@ -930,8 +988,9 @@ final class LauncherController: ObservableObject {
         // left to AppKit — no per-panel anchor setup needed here.
         // The main launcher remains below the Dock. A tightly bounded second
         // panel covers only the menu-bar rectangle at a higher level; it uses
-        // the same backdrop source and animation transform, so the Dock stays
-        // visible without introducing an independently colored strip.
+        // the same backdrop source and opacity curve. Its geometry stays fixed
+        // while the main panel scales; neither the Dock nor system settings
+        // need to be changed.
         let menuCoverHeight = max(menuBarH, safe.top)
         var builtPanels: [LauncherPanel] = [panel]
         if menuCoverHeight > 0 {
@@ -944,16 +1003,19 @@ final class LauncherController: ObservableObject {
             let coverRoot = LauncherMenuBarCoverView(
                 wallpaperURL: wallpaperURL,
                 screenSize: fullFrame.size,
-                coverHeight: menuCoverHeight
+                coverHeight: fullFrame.height
             )
             .environmentObject(self)
-            .frame(width: coverFrame.width, height: coverFrame.height)
+            .frame(width: fullFrame.width, height: fullFrame.height)
             let coverHostingView = NSHostingView(rootView: coverRoot)
-            coverHostingView.frame = NSRect(origin: .zero, size: coverFrame.size)
-            coverHostingView.autoresizingMask = [.width, .height]
+            coverHostingView.frame = NSRect(origin: .zero, size: fullFrame.size)
             coverHostingView.wantsLayer = true
+            let viewport = LauncherMenuBarViewport(
+                frame: NSRect(origin: .zero, size: coverFrame.size),
+                wallpaperView: coverHostingView
+            )
             let coverPanel = LauncherMenuBarCoverPanel(contentRect: coverFrame)
-            coverPanel.contentView = coverHostingView
+            coverPanel.contentView = viewport
             coverPanel.setFrame(coverFrame, display: false)
             coverPanel.targetFullFrame = coverFrame
             builtPanels.append(coverPanel)
@@ -1341,6 +1403,23 @@ private class LauncherPanel: NSPanel {
 
 /// Covers only the menu-bar rectangle. Its frame never intersects the Dock,
 /// so it can sit above the menu bar without hiding or blocking the Dock.
+private final class LauncherMenuBarViewport: NSView {
+    let wallpaperView: NSView
+    override var isFlipped: Bool { true }
+
+    init(frame: NSRect, wallpaperView: NSView) {
+        self.wallpaperView = wallpaperView
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.masksToBounds = true
+        // Top-align a full-screen wallpaper in this menu-height viewport.
+        // The child scales around the same full-screen centre as the launcher.
+        addSubview(wallpaperView)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
 private final class LauncherMenuBarCoverPanel: LauncherPanel {
     override init(contentRect: NSRect) {
         super.init(contentRect: contentRect)
