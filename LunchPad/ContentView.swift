@@ -303,20 +303,13 @@ struct ContentView: View {
 
             VStack(spacing: 0) {
                 HStack {
-                    // The real search capsule now lives in its own window at a
-                    // level above the menu bar (LauncherSearchPanel). Keep an
-                    // identical 250×42 transparent placeholder here so the grid
-                    // below keeps its vertical position, and publish its
-                    // on-screen rect so the search panel can pin its capsule to
-                    // the same spot.
+                    // The real search capsule lives in its own window above the
+                    // menu bar (LauncherSearchPanel); its rest position is
+                    // computed in LauncherController from the same geometry used
+                    // here. Keep an identical 250×42 transparent placeholder so
+                    // the grid below keeps its vertical position.
                     Color.clear
                         .frame(width: 250, height: 42)
-                        .background(GeometryReader { geometry in
-                            Color.clear.preference(
-                                key: SearchSlotKey.self,
-                                value: geometry.frame(in: .global)
-                            )
-                        })
                 }
                 .padding(.horizontal, 20)
                 .offset(y: searchTopObstruction > 0 ? searchTopObstruction + 2 : 24)
@@ -372,11 +365,6 @@ struct ContentView: View {
                 x: contentRect.midX,
                 y: screenSize.height - contentRect.midY
             )
-            // Publish where the search capsule placeholder sits so the search
-            // panel window (above the menu bar) can pin its capsule there.
-            .onPreferenceChange(SearchSlotKey.self) { rect in
-                controller.searchBarSlot = rect
-            }
             .opacity(store.openFolderID == nil ? 1 : 0)
             .scaleEffect(store.openFolderID == nil ? 1 : 0.96)
             .blur(radius: store.openFolderID == nil ? 0 : 8)
@@ -962,16 +950,6 @@ private struct SearchField: View {
     }
 }
 
-/// Reports the on-screen rect of the invisible search placeholder inside
-/// ContentView (top-down, window-local). The search capsule in its own window
-/// is pinned to this same rect so it stays perfectly aligned with the grid.
-private struct SearchSlotKey: PreferenceKey {
-    static var defaultValue: CGRect = .zero
-    static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
-        value = nextValue()
-    }
-}
-
 /// The full-screen root hosted inside `LauncherSearchPanel` (a window at a
 /// level ABOVE the menu bar). It draws the search capsule at the slot reported
 /// by the main content window; because the whole hosting layer is scaled each
@@ -987,33 +965,30 @@ struct LauncherSearchFieldHost: View {
     var body: some View {
         GeometryReader { proxy in
             ZStack {
-                let measured = controller.searchBarSlot
-                let slot: CGRect = measured != .zero
-                    ? measured
-                    // Provisional fallback so the capsule is visible even before
-                    // the first measurement lands (then it snaps to the measured
-                    // slot, which is authoritative).
-                    : CGRect(x: (proxy.size.width - 250) / 2,
-                             y: max(0, proxy.size.height * 0.04),
-                             width: 250, height: 42)
-                SearchField(
-                    text: $store.searchText,
-                    isFocused: $focused,
-                    onSubmit: {
-                        if let application = store.filteredApplications.first {
-                            controller.launch(application)
+                // `searchBarSlot` is computed in LauncherController from the same
+                // geometry that positions the main content, so the capsule sits
+                // exactly where the grid's transparent placeholder reserves.
+                let slot = controller.searchBarSlot
+                if slot != .zero {
+                    SearchField(
+                        text: $store.searchText,
+                        isFocused: $focused,
+                        onSubmit: {
+                            if let application = store.filteredApplications.first {
+                                controller.launch(application)
+                            }
+                        },
+                        onSettings: {
+                            openSettings()
+                            controller.presentSettingsAboveLauncher()
                         }
-                    },
-                    onSettings: {
-                        openSettings()
-                        controller.presentSettingsAboveLauncher()
-                    }
-                )
-                .frame(width: slot.width, height: slot.height)
-                .position(x: slot.midX, y: slot.midY)
-                .opacity(store.openFolderID == nil ? 1 : 0)
-                .allowsHitTesting(store.openFolderID == nil)
-                .animation(.spring(response: 0.3, dampingFraction: 0.85), value: store.openFolderID)
+                    )
+                    .frame(width: slot.width, height: slot.height)
+                    .position(x: slot.midX, y: slot.midY)
+                    .opacity(store.openFolderID == nil ? 1 : 0)
+                    .allowsHitTesting(store.openFolderID == nil)
+                    .animation(.spring(response: 0.3, dampingFraction: 0.85), value: store.openFolderID)
+                }
             }
             .frame(width: proxy.size.width, height: proxy.size.height)
         }

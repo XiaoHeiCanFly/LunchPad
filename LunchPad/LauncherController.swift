@@ -376,14 +376,14 @@ final class LauncherController: ObservableObject {
     /// reads as too much.
     private static let arriveOvershoot: CGFloat = 0.25
 
-    /// Animate panel layers directly. The wallpaper (and the menu-bar cover)
-    /// stay static and full-bleed. The launcher GRID — and, in its own window
-    /// above the menu bar, the search capsule — zoom together around the screen
-    /// centre: everything that should "grow big and settle" shares one scale and
-    /// pivot, so the search capsule rides the same `大→1 / 1→大` curve as the
-    /// grid. Opacity is applied to each surface's own window layer so they fade
-    /// in unison. No @Published change, so the SwiftUI view tree is never
-    /// re-evaluated per frame.
+    /// Animate panel layers directly. The launcher fades as ONE surface: every
+    /// window's own layer carries the shared opacity, so wallpaper, grid and
+    /// search capsule all fade together (the menu-bar cover uses a slightly
+    /// faster `a^0.6` curve so it perceptually keeps pace over the dark menu
+    /// bar). The launcher GRID — and, in its own window above the menu bar, the
+    /// search capsule — zoom together around the screen centre on the shared
+    /// `大→1 / 1→大` curve. No @Published change, so the SwiftUI view tree is
+    /// never re-evaluated per frame.
     private func applyVisualChange(_ progress: CGFloat) {
         let scale: CGFloat
         let opacity: CGFloat
@@ -392,22 +392,21 @@ final class LauncherController: ObservableObject {
             opacity = min(1, max(0, progress))
         } else {
             // One curve for both directions: opening travels progress 0→1,
-            // closing travels 1→0, so closing is exactly the reverse of
-            // opening. The grid/search arrive oversized (1 + arriveOvershoot)
-            // and settle to 1.0 while fading in; closing grows back out while
-            // fading. Clamp progress to [0, 1] so a spring overshoot can never
-            // push the scale below its final size. Fade-in starts almost
-            // immediately (~5%) and completes near 50%, so the launcher reads
-            // as "started" with very little finger travel while tracking.
+            // closing travels 1→0, so closing is exactly the reverse of opening.
+            // The grid/search arrive oversized (1 + arriveOvershoot) and settle
+            // to 1.0 while fading in; closing grows back out while fading. Clamp
+            // progress to [0, 1] so a spring overshoot can never push the scale
+            // below its final size. Fade-in starts almost immediately (~5%) and
+            // completes near 50%, so the launcher reads as "started" with very
+            // little finger travel while still tracking.
             let p = min(1, max(0, progress))
             scale = 1 + Self.arriveOvershoot * (1 - p)
             opacity = min(1, max(0, (p - 0.05) / 0.5))
         }
         // The menu-bar cover sits over the (dark, busy) system menu bar rather
         // than the desktop wallpaper, so the same numeric alpha reads as LESS
-        // opaque there: it appears late on open and disappears early on close.
-        // Compensate with a faster-to-opaque curve (`a^0.6 >= a`) so the strip
-        // perceptually fades in lock-step with the main window.
+        // opaque there. Compensate with a faster-to-opaque curve (`a^0.6 >= a`)
+        // so the strip perceptually fades in lock-step with the main window.
         let coverOpacity = min(1, max(0, pow(opacity, 0.6)))
         let center = presentationScreenCenter
         // The display link supplies every animation frame. Do not let Core
@@ -418,31 +417,31 @@ final class LauncherController: ObservableObject {
         for panel in panels {
             guard let contentView = panel.contentView, let layer = contentView.layer else { continue }
             let f = panel.targetFullFrame
-            // Fade: every surface's own window layer carries the opacity. The
-            // menu-bar cover uses the boosted curve above.
+            // Every surface's own window layer carries the shared opacity.
             layer.opacity = Float(panel is LauncherMenuBarCoverPanel ? coverOpacity : opacity)
             layer.transform = CATransform3DIdentity
             if panel is LauncherMenuBarCoverPanel {
-                // The menu-bar cover is a static crop of the same wallpaper.
-                // Its geometry never moves.
+                // The menu-bar cover is a static crop of the same wallpaper; its
+                // geometry never moves.
                 continue
             }
             if let root = contentView as? LauncherRootView {
-                // Main wrapper: wallpaper sibling stays static (scale 1); only
-                // the grid content child zooms.
+                // Main wrapper fades the whole surface; only the grid content
+                // child zooms — the wallpaper sibling stays static (scale 1).
+                root.wallpaperHostingView.layer?.opacity = 1
                 if let contentLayer = root.contentHostingView.layer {
+                    contentLayer.opacity = 1
                     applyZoom(contentLayer, scale: scale, fullFrame: f, center: center)
                 }
             } else if let passthrough = contentView as? SearchPassthroughView {
-                // Search capsule surface: the whole layer IS the pill + slot,
-                // so scale it about the same centre to match the grid, and
-                // keep the (scaled) pill rect for click pass-through.
+                // Search capsule surface: fades with the shared opacity and
+                // scales with the grid; keep the (scaled) pill rect up to date
+                // for click pass-through.
                 applyZoom(layer, scale: scale, fullFrame: f, center: center)
                 passthrough.pillRect = scaledPillRect(
                     slot: searchBarSlot,
                     scale: scale,
-                    fullFrame: f,
-                    center: center
+                    frameSize: f.size
                 )
             }
         }
@@ -471,22 +470,21 @@ final class LauncherController: ObservableObject {
     }
 
     /// Where the search capsule sits once the whole surface is scaled by
-    /// `scale` about `center` — the hit-testing region for the pass-through
-    /// view, in its own (bottom-up) local coordinates.
-    private func scaledPillRect(slot: CGRect, scale: CGFloat, fullFrame: NSRect, center: CGPoint) -> CGRect {
-        let h = fullFrame.height
-        // `slot` is top-down (from ContentView). Express its centre and size in
-        // bottom-up window-local coordinates, then scale about the screen centre.
-        let pivotLocal = CGPoint(x: center.x - fullFrame.origin.x,
-                                 y: center.y - fullFrame.origin.y)
-        let baseCenter = CGPoint(x: slot.midX, y: h - slot.midY)
-        let scaledCenter = CGPoint(x: pivotLocal.x + scale * (baseCenter.x - pivotLocal.x),
-                                   y: pivotLocal.y + scale * (baseCenter.y - pivotLocal.y))
+    /// `scale` about the screen centre — the hit-testing region for the
+    /// pass-through view, in the same TOP-DOWN coordinates the capsule is drawn
+    /// in (screen centre top-down == height/2, width/2 of the full frame).
+    private func scaledPillRect(slot: CGRect, scale: CGFloat, frameSize: CGSize) -> CGRect {
+        let cx = frameSize.width / 2
+        let cy = frameSize.height / 2
+        let scaledCenter = CGPoint(x: cx + scale * (slot.midX - cx),
+                                   y: cy + scale * (slot.midY - cy))
         let size = CGSize(width: slot.width * scale, height: slot.height * scale)
-        return CGRect(x: scaledCenter.x - size.width / 2,
-                      y: scaledCenter.y - size.height / 2,
-                      width: size.width,
-                      height: size.height)
+        // A little outward padding so the capsule's controls stay comfortably
+        // inside the clickable region (glass highlight, shadows, etc.).
+        return CGRect(x: scaledCenter.x - size.width / 2 - 6,
+                      y: scaledCenter.y - size.height / 2 - 6,
+                      width: size.width + 12,
+                      height: size.height + 12)
     }
 
     /// Called once per gesture when the fingers have moved meaningfully.
@@ -1048,6 +1046,7 @@ final class LauncherController: ObservableObject {
         // the menu-bar rectangle at a higher level, using the same backdrop
         // source and opacity curve.
         let panel = LauncherPanel(contentRect: fullFrame)
+        panel.acceptsKey = false // see LauncherPanel.acceptsKey
         panel.contentView = root
         panel.setFrame(fullFrame, display: false)
         panel.targetFullFrame = fullFrame
@@ -1080,6 +1079,25 @@ final class LauncherController: ObservableObject {
             coverPanel.targetFullFrame = coverFrame
             builtPanels.append(coverPanel)
         }
+        // The search capsule's rest position, derived from the SAME vertical
+        // layout math ContentView uses to centre its content: the launcher box
+        // is centred in the Dock-excluded content area, and the capsule sits
+        // just under the menu bar / notch inset (topObstruction + 2), matching
+        // the transparent placeholder that reserves that row in the grid.
+        let contentAreaHeight = contentRect.height
+        let bottomMargin: CGFloat = 14 + safe.bottom
+        let launcherBoxHeight = max(320, contentAreaHeight - safe.top - bottomMargin)
+        let contentTop = (contentAreaHeight - launcherBoxHeight) / 2
+            + (safe.top - bottomMargin) / 2
+        let pillTop = contentTop + topObstruction + 2
+        let pillWidth: CGFloat = 250
+        let pillHeight: CGFloat = 42
+        let centerX = contentRect.midX - contentRect.origin.x
+        searchBarSlot = CGRect(
+            x: centerX - pillWidth / 2,
+            y: pillTop,
+            width: pillWidth,
+            height: pillHeight)
         // The search capsule window: full-screen and transparent, at a level
         // ABOVE the menu bar (and above the menu-bar cover), so the capsule can
         // zoom together with the grid and never be clipped by the menu strip.
@@ -1099,6 +1117,9 @@ final class LauncherController: ObservableObject {
             frame: NSRect(origin: .zero, size: fullFrame.size),
             hostingView: searchHosting
         )
+        // Rest position hit area is known up front; applyVisualChange refines it
+        // as the capsule zooms.
+        passthrough.pillRect = searchBarSlot
         let searchPanel = LauncherSearchPanel(contentRect: fullFrame)
         searchPanel.contentView = passthrough
         searchPanel.setFrame(fullFrame, display: false)
@@ -1472,8 +1493,14 @@ private class LauncherPanel: NSPanel {
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         animationBehavior = .none; acceptsMouseMovedEvents = true
     }
-    override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { true }
+    /// Whether the window can become key. The MAIN launcher panel is kept
+    /// non-keyable so that clicking it (blank to dismiss, or a tile to launch)
+    /// delivers its first click directly instead of first "stealing" key from
+    /// the search window and swallowing the click; the search capsule window
+    /// stays keyable so typing goes into the field.
+    var acceptsKey = true
+    override var canBecomeKey: Bool { acceptsKey }
+    override var canBecomeMain: Bool { acceptsKey }
     /// Returns a frame scaled to `factor` around the center of targetFullFrame.
     func scaledFrame(_ factor: CGFloat) -> NSRect {
         let w = targetFullFrame.width * factor
@@ -1577,10 +1604,11 @@ private final class LauncherSearchPanel: LauncherPanel {
 /// Full-screen transparent content view for `LauncherSearchPanel`. Everything
 /// is click-through (hitTest returns nil) EXCEPT the search capsule's current
 /// scaled rect, so mouse events reach the launcher/cover windows below while
-/// the capsule itself stays interactive for typing.
+/// the capsule itself stays interactive (text field, clear / menu buttons).
 private final class SearchPassthroughView: NSView {
-    /// The capsule's current hit area, in this view's (bottom-up) local
-    /// coordinates, updated every animation frame by `applyVisualChange`.
+    /// The capsule's current hit area, in TOP-DOWN local coordinates (matching
+    /// how the capsule is drawn in SwiftUI). Updated every animation frame by
+    /// `applyVisualChange`, and pre-set at build time.
     var pillRect: CGRect = .zero
 
     init(frame: NSRect, hostingView: NSView) {
@@ -1594,9 +1622,12 @@ private final class SearchPassthroughView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        // Outside the capsule the window ignores the click and it passes to the
-        // windows below (blank dismiss, grid tiles, menu-bar cover tap-to-hide).
-        guard pillRect.contains(point) else { return nil }
+        // The point arrives in this (non-flipped, bottom-up) view's coordinate
+        // system; flip Y to compare against the top-down capsule rect. Outside
+        // the capsule the window ignores the click and it passes to the windows
+        // below (blank dismiss, grid tiles, menu-bar cover tap-to-hide).
+        let topDownPoint = NSPoint(x: point.x, y: bounds.height - point.y)
+        guard pillRect.contains(topDownPoint) else { return nil }
         return super.hitTest(point)
     }
 }
