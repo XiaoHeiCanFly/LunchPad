@@ -12,16 +12,9 @@ struct LauncherDisplayOption: Identifiable, Hashable {
     let name: String
 }
 
-/// Only the search field observes this state, not the application grid.
-@MainActor
-final class LauncherSearchAnimation: ObservableObject {
-    @Published var scale: CGFloat = 1
-}
-
 @MainActor
 final class LauncherController: ObservableObject {
     static let shared = LauncherController()
-    let searchAnimation = LauncherSearchAnimation()
 
     @Published private(set) var isPresented = false
     @Published private(set) var accessibilityPermissionGranted = false
@@ -32,6 +25,11 @@ final class LauncherController: ObservableObject {
     @Published private(set) var loginItemStatus: SMAppService.Status = .notRegistered
     @Published private(set) var displayOptions: [LauncherDisplayOption] = []
 
+    /// The search capsule's on-screen rect (top-down, main-window-local),
+    /// measured and published by `ContentView`. The standalone search window
+    /// pins its capsule to this slot.
+    @Published var searchBarSlot: CGRect = .zero
+
     let store = LauncherStore()
 
     /// Display-link-driven progress engine for all open/close/gesture
@@ -39,6 +37,10 @@ final class LauncherController: ObservableObject {
     private let animator = LauncherGestureAnimator()
 
     private var panels: [LauncherPanel] = []
+    /// The above-the-menu-bar window that hosts the search capsule (zooms with
+    /// the grid). Kept separate so show/hide can make IT key instead of the main
+    /// launcher panel.
+    private var searchPanel: LauncherSearchPanel?
     private var uninstallDimmingPanel: NSPanel?
     private var uninstallDialogPanel: NSPanel?
     private var globalSystemKeyMonitor: Any?
@@ -240,7 +242,7 @@ final class LauncherController: ObservableObject {
         // it key — and a non-key window consumes the first click just to become
         // key, so blank clicks would need two after a re-invoke. Make it key so
         // the first click always reaches the content view.
-        panels.first?.makeKey()
+        makeSearchPanelKey()
         diagnosticRecord("presentation", "show-ordered id=\(attemptID.uuidString) \(diagnosticPanelsSummary())")
         schedulePresentationProbes(for: attemptID)
     }
@@ -293,6 +295,13 @@ final class LauncherController: ObservableObject {
 
     private var reduceMotion: Bool {
         UserDefaults.standard.bool(forKey: "reduceMotion")
+    }
+
+    /// The search capsule's window takes key so typing goes straight into the
+    /// field (the main launcher panel can stay non-key — clicks on it still
+    /// reach its tiles/catcher). Falls back to the main panel pre-build.
+    private func makeSearchPanelKey() {
+        (searchPanel ?? panels.first)?.makeKey()
     }
 
     // MARK: - Diagnostics
@@ -353,8 +362,28 @@ final class LauncherController: ObservableObject {
 
     // MARK: - Gesture (animator-driven, no SwiftUI re-render)
 
-    /// Animate panel layers directly. Only the search field observes the small
-    /// counter-scale state; the application grid is not invalidated per frame.
+    /// How far past its resting size the launcher GRID (and its search capsule,
+    /// in the above-the-menu-bar search panel) is at the very start of an
+    /// opening (progress 0): scale runs `1 + arriveOvershoot → 1` while opening
+    /// and `1 → 1 + arriveOvershoot` while closing — everything arrives
+    /// oversized and settles to 1.0, and grows back out as it dismisses
+    /// (native Launchpad).
+    ///
+    /// A large value is fine for the grid; the search capsule is rendered in a
+    /// window above the menu bar so it is not clipped by the menu strip. At the
+    /// most extreme overshoot the capsule may briefly rise past the physical
+    /// top of the screen while still mostly transparent — lower this if that
+    /// reads as too much.
+    private static let arriveOvershoot: CGFloat = 0.25
+
+    /// Animate panel layers directly. The wallpaper (and the menu-bar cover)
+    /// stay static and full-bleed. The launcher GRID — and, in its own window
+    /// above the menu bar, the search capsule — zoom together around the screen
+    /// centre: everything that should "grow big and settle" shares one scale and
+    /// pivot, so the search capsule rides the same `大→1 / 1→大` curve as the
+    /// grid. Opacity is applied to each surface's own window layer so they fade
+    /// in unison. No @Published change, so the SwiftUI view tree is never
+    /// re-evaluated per frame.
     private func applyVisualChange(_ progress: CGFloat) {
         let scale: CGFloat
         let opacity: CGFloat
@@ -364,87 +393,57 @@ final class LauncherController: ObservableObject {
         } else {
             // One curve for both directions: opening travels progress 0→1,
             // closing travels 1→0, so closing is exactly the reverse of
-            // opening. The grid arrives oversized (1.25) and settles to 1.0
-            // while fading in; closing grows back to 1.25 while fading out.
-            // Clamp progress to [0, 1] so a spring overshoot can never push
-            // the scale below the final size (which would read as an end-of-
-            // open bounce). Fade-in starts almost immediately (~5% progress)
-            // and reaches full opacity near 55%, so the launcher reads as
-            // "started" with very little finger travel while still tracking.
+            // opening. The grid/search arrive oversized (1 + arriveOvershoot)
+            // and settle to 1.0 while fading in; closing grows back out while
+            // fading. Clamp progress to [0, 1] so a spring overshoot can never
+            // push the scale below its final size. Fade-in starts almost
+            // immediately (~5%) and completes near 50%, so the launcher reads
+            // as "started" with very little finger travel while tracking.
             let p = min(1, max(0, progress))
-            scale = 1 + 0.25 * (1 - p)
+            scale = 1 + Self.arriveOvershoot * (1 - p)
             opacity = min(1, max(0, (p - 0.05) / 0.5))
         }
+        // The menu-bar cover sits over the (dark, busy) system menu bar rather
+        // than the desktop wallpaper, so the same numeric alpha reads as LESS
+        // opaque there: it appears late on open and disappears early on close.
+        // Compensate with a faster-to-opaque curve (`a^0.6 >= a`) so the strip
+        // perceptually fades in lock-step with the main window.
+        let coverOpacity = min(1, max(0, pow(opacity, 0.6)))
         let center = presentationScreenCenter
-        if searchAnimation.scale != scale { searchAnimation.scale = scale }
-        let menuCoverFrame = panels.first(where: { $0 is LauncherMenuBarCoverPanel })?.targetFullFrame
         // The display link supplies every animation frame. Do not let Core
         // Animation add independent interpolation to the menu-bar cover.
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
         for panel in panels {
-            guard let layer = panel.contentView?.layer else { continue }
+            guard let contentView = panel.contentView, let layer = contentView.layer else { continue }
             let f = panel.targetFullFrame
+            // Fade: every surface's own window layer carries the opacity. The
+            // menu-bar cover uses the boosted curve above.
+            layer.opacity = Float(panel is LauncherMenuBarCoverPanel ? coverOpacity : opacity)
+            layer.transform = CATransform3DIdentity
             if panel is LauncherMenuBarCoverPanel {
-                // Keep the crop fixed at the menu bar. It shares the main
-                // panel's exact visibility threshold and fade curve, but not
-                // its screen-centred scale (which made this strip slide in).
-                layer.anchorPoint = .zero
-                layer.position = .zero
-                layer.bounds = CGRect(origin: .zero, size: f.size)
-                layer.transform = CATransform3DIdentity
-                layer.opacity = Float(opacity)
-                // Scale the full wallpaper INSIDE a stationary viewport.
-                // Scaling a pre-cropped strip moves its edges; not scaling
-                // its pixels at all makes the wallpaper discontinuous below.
-                if let viewport = panel.contentView as? LauncherMenuBarViewport,
-                   let wallpaperLayer = viewport.wallpaperView.layer {
-                    let size = viewport.wallpaperView.bounds.size
-                    wallpaperLayer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
-                    wallpaperLayer.position = CGPoint(x: size.width / 2, y: size.height / 2)
-                    wallpaperLayer.bounds = CGRect(origin: .zero, size: size)
-                    wallpaperLayer.transform = CATransform3DMakeScale(scale, scale, 1)
-                }
+                // The menu-bar cover is a static crop of the same wallpaper.
+                // Its geometry never moves.
                 continue
             }
-            // Pin the layer's anchor to the shared screen center. Re-asserted
-            // every frame because AppKit sets a window content layer's anchor
-            // to (0,0) — with that default, a plain scale grows from the
-            // panel's corner instead of the center. With
-            //   anchorPoint = pivot / size  and  position = pivot,
-            // the frame stays (0,0,size) (no shift) and the scale expands
-            // toward the on-screen center shared by every panel (no seams).
-            let pivot = CGPoint(x: center.x - f.origin.x,
-                                y: center.y - f.origin.y)
-            layer.anchorPoint = CGPoint(x: pivot.x / f.width,
-                                        y: pivot.y / f.height)
-            layer.position = pivot
-            layer.bounds = CGRect(origin: .zero, size: f.size)
-            layer.opacity = Float(opacity)
-            layer.transform = CATransform3DMakeScale(scale, scale, 1)
-            if let menuCoverFrame, f.intersects(menuCoverFrame) {
-                // Do not fade two wallpaper surfaces over the menu bar.
-                // Two layers at alpha a produce 1-(1-a)^2 there, making the
-                // cover appear opaque sooner than the rest of the launcher.
-                // Keep this cut at the fixed screen boundary by undoing the
-                // main layer's scale when expressing it in local coordinates.
-                let flipped = panel.contentView?.isFlipped == true
-                let boundary = flipped
-                    ? f.maxY - menuCoverFrame.minY
-                    : menuCoverFrame.minY - f.minY
-                let localBoundary = min(f.height, max(0,
-                    pivot.y + (boundary - pivot.y) / scale))
-                let visibleRect = flipped
-                    ? CGRect(x: 0, y: localBoundary, width: f.width,
-                             height: f.height - localBoundary)
-                    : CGRect(x: 0, y: 0, width: f.width, height: localBoundary)
-                let contentMask = layer.mask ?? CALayer()
-                contentMask.backgroundColor = NSColor.black.cgColor
-                contentMask.frame = visibleRect
-                if layer.mask == nil { layer.mask = contentMask }
-            } else {
-                layer.mask = nil
+            if let root = contentView as? LauncherRootView {
+                // Main wrapper: wallpaper sibling stays static (scale 1); only
+                // the grid content child zooms.
+                if let contentLayer = root.contentHostingView.layer {
+                    applyZoom(contentLayer, scale: scale, fullFrame: f, center: center)
+                }
+            } else if let passthrough = contentView as? SearchPassthroughView {
+                // Search capsule surface: the whole layer IS the pill + slot,
+                // so scale it about the same centre to match the grid, and
+                // keep the (scaled) pill rect for click pass-through.
+                applyZoom(layer, scale: scale, fullFrame: f, center: center)
+                passthrough.pillRect = scaledPillRect(
+                    slot: searchBarSlot,
+                    scale: scale,
+                    fullFrame: f,
+                    center: center
+                )
             }
         }
         let bucket = min(4, max(0, Int((min(1, max(0, progress)) * 4).rounded(.down))))
@@ -452,6 +451,42 @@ final class LauncherController: ObservableObject {
             lastDiagnosticsProgressBucket = bucket
             diagnosticRecord("animation", "progress=\(diagnosticNumber(progress)) scale=\(diagnosticNumber(scale)) opacity=\(diagnosticNumber(opacity)) panels=\(panels.count)")
         }
+    }
+
+    /// Pin `layer`'s anchor to the shared screen centre and scale it there.
+    /// Re-asserted every frame because AppKit sets a window content layer's
+    /// anchor to (0,0) — with that default a plain scale would grow from the
+    /// panel's corner instead of the centre. With
+    ///   anchorPoint = pivot / size  and  position = pivot,
+    /// the frame stays (0,0,size) (no shift) and the scale expands toward the
+    /// on-screen centre shared by every panel (no seams).
+    private func applyZoom(_ layer: CALayer, scale: CGFloat, fullFrame: NSRect, center: CGPoint) {
+        let pivot = CGPoint(x: center.x - fullFrame.origin.x,
+                            y: center.y - fullFrame.origin.y)
+        layer.anchorPoint = CGPoint(x: pivot.x / fullFrame.width,
+                                    y: pivot.y / fullFrame.height)
+        layer.position = pivot
+        layer.bounds = CGRect(origin: .zero, size: fullFrame.size)
+        layer.transform = CATransform3DMakeScale(scale, scale, 1)
+    }
+
+    /// Where the search capsule sits once the whole surface is scaled by
+    /// `scale` about `center` — the hit-testing region for the pass-through
+    /// view, in its own (bottom-up) local coordinates.
+    private func scaledPillRect(slot: CGRect, scale: CGFloat, fullFrame: NSRect, center: CGPoint) -> CGRect {
+        let h = fullFrame.height
+        // `slot` is top-down (from ContentView). Express its centre and size in
+        // bottom-up window-local coordinates, then scale about the screen centre.
+        let pivotLocal = CGPoint(x: center.x - fullFrame.origin.x,
+                                 y: center.y - fullFrame.origin.y)
+        let baseCenter = CGPoint(x: slot.midX, y: h - slot.midY)
+        let scaledCenter = CGPoint(x: pivotLocal.x + scale * (baseCenter.x - pivotLocal.x),
+                                   y: pivotLocal.y + scale * (baseCenter.y - pivotLocal.y))
+        let size = CGSize(width: slot.width * scale, height: slot.height * scale)
+        return CGRect(x: scaledCenter.x - size.width / 2,
+                      y: scaledCenter.y - size.height / 2,
+                      width: size.width,
+                      height: size.height)
     }
 
     /// Called once per gesture when the fingers have moved meaningfully.
@@ -480,7 +515,7 @@ final class LauncherController: ObservableObject {
         for panel in panels { panel.orderFront(nil) }
         // Re-assert after display (AppKit re-syncs layer geometry on order).
         applyVisualChange(animator.visualProgress)
-        panels.first?.makeKey()
+        makeSearchPanelKey()
         diagnosticRecord("gesture", "panels-ordered id=\(attemptID.uuidString) \(diagnosticPanelsSummary())")
         schedulePresentationProbes(for: attemptID)
     }
@@ -923,6 +958,8 @@ final class LauncherController: ObservableObject {
     private func rebuildPanels() {
         diagnosticRecord("panel", "rebuild-start existing=\(panels.count) mode=\(displayMode) screens=\(NSScreen.screens.count)")
         panels.forEach { $0.close() }
+        searchPanel = nil
+        searchBarSlot = .zero
         // Reset presented state so the next show()/toggle() starts clean.
         // Without this, unplugging the display that held the launcher leaves
         // isPresented = true with an empty panels array, which jams the
@@ -968,30 +1005,53 @@ final class LauncherController: ObservableObject {
         let contentRect = NSRect(x: dockL, y: dockB,
                                  width: screen.frame.width - dockL - dockR,
                                  height: screen.frame.height - dockB)
-        let rootView = ContentView(wallpaperURL: wallpaperURL,
+        // Two surfaces stack inside one wrapper view (LauncherRootView):
+        //   1. wallpaperHostingView — the static blurred wallpaper, full-bleed.
+        //   2. contentHostingView   — grid / search field / folder overlay;
+        //      the ONLY layer that scales (see applyVisualChange).
+        // The menu-bar strip above `menuCoverHeight` is painted by a separate
+        // cover panel at a higher window level; a constant mask on the wrapper
+        // crops the wallpaper out of that strip so the two wallpaper surfaces
+        // never double-fade over the menu bar.
+        let contentRoot = ContentView(
             screenSize: fullFrame.size,
             contentRect: contentRect,
             searchTopObstruction: topObstruction,
             screenSafeInsets: EdgeInsets(top: safe.top, leading: safe.left, bottom: safe.bottom, trailing: safe.right))
             .environmentObject(store).environmentObject(self)
             .frame(width: fullFrame.width, height: fullFrame.height)
-        let hv = NSHostingView(rootView: rootView)
-        hv.frame = NSRect(origin: .zero, size: fullFrame.size)
-        hv.autoresizingMask = [.width, .height]
+        let contentHostingView = NSHostingView(rootView: contentRoot)
+        contentHostingView.frame = NSRect(origin: .zero, size: fullFrame.size)
+        contentHostingView.autoresizingMask = [.width, .height]
+        contentHostingView.wantsLayer = true
+        contentHostingView.layer?.opacity = 1
+
+        let wallpaperRoot = LauncherWallpaperRoot(
+            wallpaperURL: wallpaperURL,
+            screenSize: fullFrame.size)
+            .frame(width: fullFrame.width, height: fullFrame.height)
+        let wallpaperHostingView = NSHostingView(rootView: wallpaperRoot)
+        wallpaperHostingView.frame = NSRect(origin: .zero, size: fullFrame.size)
+        wallpaperHostingView.autoresizingMask = [.width, .height]
+        wallpaperHostingView.wantsLayer = true
+        wallpaperHostingView.layer?.opacity = 1
+
+        let root = LauncherRootView(
+            frame: fullFrame,
+            wallpaperHostingView: wallpaperHostingView,
+            contentHostingView: contentHostingView)
+
+        let menuCoverHeight = max(menuBarH, safe.top)
+        // The wrapper is never scaled (opacity + constant mask only), so its
+        // own anchor/position/bounds are left to AppKit. The main launcher
+        // remains below the Dock; a tightly bounded second panel covers only
+        // the menu-bar rectangle at a higher level, using the same backdrop
+        // source and opacity curve.
         let panel = LauncherPanel(contentRect: fullFrame)
-        panel.contentView = hv
+        panel.contentView = root
         panel.setFrame(fullFrame, display: false)
         panel.targetFullFrame = fullFrame
-        hv.wantsLayer = true
-        // Scaling is pivoted around the screen center via `layer.transform`
-        // only (see applyVisualChange), so anchorPoint/position/bounds are
-        // left to AppKit — no per-panel anchor setup needed here.
-        // The main launcher remains below the Dock. A tightly bounded second
-        // panel covers only the menu-bar rectangle at a higher level; it uses
-        // the same backdrop source and opacity curve. Its geometry stays fixed
-        // while the main panel scales; neither the Dock nor system settings
-        // need to be changed.
-        let menuCoverHeight = max(menuBarH, safe.top)
+        if menuCoverHeight > 0 { root.installTopMask(hidingTopHeight: menuCoverHeight) }
         var builtPanels: [LauncherPanel] = [panel]
         if menuCoverHeight > 0 {
             let coverFrame = NSRect(
@@ -1020,6 +1080,31 @@ final class LauncherController: ObservableObject {
             coverPanel.targetFullFrame = coverFrame
             builtPanels.append(coverPanel)
         }
+        // The search capsule window: full-screen and transparent, at a level
+        // ABOVE the menu bar (and above the menu-bar cover), so the capsule can
+        // zoom together with the grid and never be clipped by the menu strip.
+        // Only the capsule rect is interactive; everything else is click-through
+        // (SearchPassthroughView). It is animated by applyVisualChange exactly
+        // like the main grid layer (same scale + screen-centre pivot).
+        let searchRoot = LauncherSearchFieldHost()
+            .environmentObject(store)
+            .environmentObject(self)
+            .frame(width: fullFrame.width, height: fullFrame.height)
+        let searchHosting = NSHostingView(rootView: searchRoot)
+        searchHosting.frame = NSRect(origin: .zero, size: fullFrame.size)
+        searchHosting.autoresizingMask = [.width, .height]
+        searchHosting.wantsLayer = true
+        searchHosting.layer?.opacity = 1
+        let passthrough = SearchPassthroughView(
+            frame: NSRect(origin: .zero, size: fullFrame.size),
+            hostingView: searchHosting
+        )
+        let searchPanel = LauncherSearchPanel(contentRect: fullFrame)
+        searchPanel.contentView = passthrough
+        searchPanel.setFrame(fullFrame, display: false)
+        searchPanel.targetFullFrame = fullFrame
+        self.searchPanel = searchPanel
+        builtPanels.append(searchPanel)
         panels = builtPanels
         diagnosticRecord("panel", "rebuild-finished display=\(panelDisplayID ?? -1) screen=\(screen.localizedName) frame=\(NSStringFromRect(fullFrame)) visible=\(NSStringFromRect(screen.visibleFrame)) safe=\(screen.safeAreaInsets) panelLevel=\(panel.level.rawValue)")
         if isPresented { panels.forEach { $0.orderFront(nil) } }
@@ -1401,6 +1486,51 @@ private class LauncherPanel: NSPanel {
     }
 }
 
+/// Full-screen container for the launcher's two surfaces: the static blurred
+/// wallpaper (back) and the zooming content (front, see applyVisualChange).
+///
+/// Opacity lives on THIS wrapper's layer so every surface fades together, and
+/// a one-time constant mask crops the wallpaper out of the menu-bar strip
+/// (painted by `LauncherMenuBarCoverPanel` above). Because the wrapper itself
+/// is never scaled, the mask stays fixed in screen space no matter how far the
+/// content child is zoomed — no per-frame scale math is needed.
+private final class LauncherRootView: NSView {
+    let wallpaperHostingView: NSView
+    let contentHostingView: NSView
+
+    init(frame: NSRect, wallpaperHostingView: NSView, contentHostingView: NSView) {
+        self.wallpaperHostingView = wallpaperHostingView
+        self.contentHostingView = contentHostingView
+        super.init(frame: frame)
+        wantsLayer = true
+        for view in [wallpaperHostingView, contentHostingView] {
+            view.frame = NSRect(origin: .zero, size: frame.size)
+            view.autoresizingMask = [.width, .height]
+            addSubview(view)
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// Hides the top `hidingTopHeight` points of the wrapper once — that strip
+    /// is drawn by the separate menu-bar cover window, so the two wallpaper
+    /// surfaces never double-fade over the menu bar. The mask frame is in the
+    /// (unscaled) wrapper layer coordinates, so it crops a fixed band of the
+    /// screen regardless of the content child's per-frame zoom.
+    func installTopMask(hidingTopHeight: CGFloat) {
+        guard let layer else { return }
+        let hidden = min(max(0, hidingTopHeight), frame.height)
+        let mask = CALayer()
+        mask.backgroundColor = NSColor.black.cgColor
+        // Coordinate space follows the view's flip. A window content view is
+        // bottom-up by default: keep rows [0, H-hidden], crop rows above.
+        mask.frame = isFlipped
+            ? CGRect(x: 0, y: hidden, width: frame.width, height: frame.height - hidden)
+            : CGRect(x: 0, y: 0, width: frame.width, height: frame.height - hidden)
+        layer.mask = mask
+    }
+}
+
 /// Covers only the menu-bar rectangle. Its frame never intersects the Dock,
 /// so it can sit above the menu bar without hiding or blocking the Dock.
 private final class LauncherMenuBarViewport: NSView {
@@ -1412,8 +1542,10 @@ private final class LauncherMenuBarViewport: NSView {
         super.init(frame: frame)
         wantsLayer = true
         layer?.masksToBounds = true
-        // Top-align a full-screen wallpaper in this menu-height viewport.
-        // The child scales around the same full-screen centre as the launcher.
+        // Top-align the full-screen wallpaper in this menu-height viewport and
+        // clip the remainder. Both this strip and the main launcher's wallpaper
+        // are now STATIC (scale 1), so the top `menuCoverHeight` rows they show
+        // line up exactly at the boundary — nothing is scaled per frame.
         addSubview(wallpaperView)
     }
 
@@ -1428,6 +1560,45 @@ private final class LauncherMenuBarCoverPanel: LauncherPanel {
     }
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
+}
+
+/// The window that hosts the search capsule. Full-screen, transparent, at a
+/// level ABOVE the menu bar and the menu-bar cover strip (mainMenu + 2), so the
+/// capsule can zoom together with the launcher grid and is never clipped by the
+/// menu strip. It is made key so typing goes straight into the field.
+private final class LauncherSearchPanel: LauncherPanel {
+    override init(contentRect: NSRect) {
+        super.init(contentRect: contentRect)
+        level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 2)
+        acceptsMouseMovedEvents = false
+    }
+}
+
+/// Full-screen transparent content view for `LauncherSearchPanel`. Everything
+/// is click-through (hitTest returns nil) EXCEPT the search capsule's current
+/// scaled rect, so mouse events reach the launcher/cover windows below while
+/// the capsule itself stays interactive for typing.
+private final class SearchPassthroughView: NSView {
+    /// The capsule's current hit area, in this view's (bottom-up) local
+    /// coordinates, updated every animation frame by `applyVisualChange`.
+    var pillRect: CGRect = .zero
+
+    init(frame: NSRect, hostingView: NSView) {
+        super.init(frame: frame)
+        wantsLayer = true
+        hostingView.frame = NSRect(origin: .zero, size: frame.size)
+        hostingView.autoresizingMask = [.width, .height]
+        addSubview(hostingView)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        // Outside the capsule the window ignores the click and it passes to the
+        // windows below (blank dismiss, grid tiles, menu-bar cover tap-to-hide).
+        guard pillRect.contains(point) else { return nil }
+        return super.hitTest(point)
+    }
 }
 
 private final class UninstallDimmingPanel: NSPanel {

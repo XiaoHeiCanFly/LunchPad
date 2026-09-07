@@ -225,8 +225,7 @@ private struct PagesGrid: View {
 }
 
 struct ContentView: View {
-    let wallpaperURL: URL?
-    /// Full-screen window (== the display frame). The backdrop spans this.
+    /// Full-screen window (== the display frame). The content spans this.
     let screenSize: CGSize
     /// Rect inside the window where the launcher content lives — the display
     /// area above/outside the Dock. The grid/search never enter the Dock zone.
@@ -236,9 +235,6 @@ struct ContentView: View {
     @EnvironmentObject private var store: LauncherStore
     @EnvironmentObject private var controller: LauncherController
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @Environment(\.openSettings) private var openSettings
-    @FocusState private var searchFocused: Bool
     /// Finger-follow offset during a page swipe. `@GestureState` resets to zero
     /// automatically when the drag ends, in the same transaction as the
     /// `currentPage` change, so the release animation (driven by the wrapper's
@@ -248,7 +244,6 @@ struct ContentView: View {
     @AppStorage("grid-columns") private var columnCount = 7
     @AppStorage("grid-rows") private var rowCount = 5
     @AppStorage("icon-size") private var iconSize = 104.0
-    @AppStorage("background-blur-radius") private var backgroundBlurRadius = 34.0
 
     private var pageSize: Int { max(1, store.pageCapacity) }
     private var contentSize: CGSize { contentRect.size }
@@ -287,17 +282,13 @@ struct ContentView: View {
 
     var body: some View {
         ZStack {
-            // The backdrop is one continuous full-screen surface, including the
-            // area under the Dock — no separate Dock strip, so there is no
-            // seam or blank bar when the launcher appears.
-            LauncherBackdrop(
-                reduceTransparency: reduceTransparency,
-                wallpaperURL: wallpaperURL,
-                screenSize: screenSize,
-                blurRadius: backgroundBlurRadius
-            )
-                .frame(width: screenSize.width, height: screenSize.height)
-
+            // The wallpaper is no longer drawn here: the launcher panel hosts
+            // it on a separate static full-screen layer behind this content
+            // layer (see LauncherRootView), so the launcher GRID can zoom
+            // around the screen centre while the blurred wallpaper stays
+            // perfectly still and full-bleed — no edge gaps, no menu-bar seam.
+            // The search field above counter-scales itself (see SearchField) so
+            // it stays as native chrome and never gets clipped.
             // Any click on blank space dismisses on the FIRST click — an
             // NSView-backed surface, because SwiftUI's `.onTapGesture` would
             // swallow the first click while the search field is focused. It sits
@@ -312,25 +303,23 @@ struct ContentView: View {
 
             VStack(spacing: 0) {
                 HStack {
-                    SearchField(
-                        animation: controller.searchAnimation,
-                        screenHeight: screenSize.height,
-                        text: $store.searchText,
-                        isFocused: $searchFocused,
-                        onSubmit: {
-                            if let application = store.filteredApplications.first {
-                                controller.launch(application)
-                            }
-                        },
-                        onSettings: {
-                            openSettings()
-                            controller.presentSettingsAboveLauncher()
-                        }
-                    )
-                        .frame(maxWidth: 250)
+                    // The real search capsule now lives in its own window at a
+                    // level above the menu bar (LauncherSearchPanel). Keep an
+                    // identical 250×42 transparent placeholder here so the grid
+                    // below keeps its vertical position, and publish its
+                    // on-screen rect so the search panel can pin its capsule to
+                    // the same spot.
+                    Color.clear
+                        .frame(width: 250, height: 42)
+                        .background(GeometryReader { geometry in
+                            Color.clear.preference(
+                                key: SearchSlotKey.self,
+                                value: geometry.frame(in: .global)
+                            )
+                        })
                 }
-                    .padding(.horizontal, 20)
-                    .offset(y: searchTopObstruction > 0 ? searchTopObstruction + 2 : 24)
+                .padding(.horizontal, 20)
+                .offset(y: searchTopObstruction > 0 ? searchTopObstruction + 2 : 24)
 
                 Group {
                     if store.isScanning && store.entries.isEmpty {
@@ -383,6 +372,11 @@ struct ContentView: View {
                 x: contentRect.midX,
                 y: screenSize.height - contentRect.midY
             )
+            // Publish where the search capsule placeholder sits so the search
+            // panel window (above the menu bar) can pin its capsule there.
+            .onPreferenceChange(SearchSlotKey.self) { rect in
+                controller.searchBarSlot = rect
+            }
             .opacity(store.openFolderID == nil ? 1 : 0)
             .scaleEffect(store.openFolderID == nil ? 1 : 0.96)
             .blur(radius: store.openFolderID == nil ? 0 : 8)
@@ -436,16 +430,6 @@ struct ContentView: View {
         .onChange(of: store.searchText) { _, _ in store.currentPage = 0 }
         .onChange(of: store.uninstallRequest?.id) { _, _ in
             controller.synchronizeUninstallPresentation()
-        }
-        .onAppear { searchFocused = true }
-        .onChange(of: controller.isPresented) { _, presented in
-            guard presented else { return }
-            // `.onAppear` only fires when the view is first mounted, so a
-            // re-invoked launcher wouldn't re-focus the search field (breaking
-            // instant typing). `show()` flips `isPresented` before the panel is
-            // ordered front and made key, so defer focus to the next main-loop
-            // tick.
-            Task { @MainActor in searchFocused = true }
         }
     }
 
@@ -789,6 +773,28 @@ struct LauncherBackdrop: View {
     }
 }
 
+/// The static, full-screen wallpaper surface of the launcher. Hosted on its
+/// own NSHostingView BEHIND the zooming content layer (see LauncherRootView),
+/// so the blurred wallpaper stays still and full-bleed while the grid and
+/// search field zoom in/out around the screen centre.
+struct LauncherWallpaperRoot: View {
+    let wallpaperURL: URL?
+    let screenSize: CGSize
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @AppStorage("background-blur-radius") private var backgroundBlurRadius = 34.0
+
+    var body: some View {
+        LauncherBackdrop(
+            reduceTransparency: reduceTransparency,
+            wallpaperURL: wallpaperURL,
+            screenSize: screenSize,
+            blurRadius: backgroundBlurRadius
+        )
+        .frame(width: screenSize.width, height: screenSize.height)
+        .preferredColorScheme(.dark)
+    }
+}
+
 /// Pixel-aligned crop of the full-screen launcher backdrop for the small panel
 /// that covers the system menu bar. Shifting the same full-size backdrop down
 /// aligns its top edge with the display before this view clips the remainder.
@@ -910,17 +916,16 @@ private struct BlankAreaCatcher: NSViewRepresentable {
     }
 }
 
+/// The search capsule. It lives in its OWN full-screen window at a level
+/// above the menu bar (see `LauncherSearchPanel`), so it can zoom together
+/// with the launcher grid without ever being clipped by the menu-bar strip.
 private struct SearchField: View {
-    @ObservedObject var animation: LauncherSearchAnimation
-    let screenHeight: CGFloat
     @Binding var text: String
     let isFocused: FocusState<Bool>.Binding
     let onSubmit: () -> Void
     let onSettings: () -> Void
 
     var body: some View {
-        let launcherScale = animation.scale
-        let screenCenterY = screenHeight / 2
         HStack(spacing: 9) {
             Image(systemName: "magnifyingglass")
                 .foregroundStyle(.white.opacity(0.72))
@@ -954,15 +959,73 @@ private struct SearchField: View {
         .padding(.horizontal, 15)
         .frame(height: 42)
         .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .visualEffect { content, geometry in
-            // The enclosing AppKit layer scales around the screen centre.
-            // Counter that transform for search only, keeping its normal top
-            // inset and size throughout opening, closing and reversed pinches.
-            // Geometry is the untransformed SwiftUI layout in window space.
-            let top = geometry.frame(in: .global).minY
-            return content
-                .scaleEffect(1 / launcherScale, anchor: .top)
-                .offset(y: (screenCenterY - top) * (1 - 1 / launcherScale))
+    }
+}
+
+/// Reports the on-screen rect of the invisible search placeholder inside
+/// ContentView (top-down, window-local). The search capsule in its own window
+/// is pinned to this same rect so it stays perfectly aligned with the grid.
+private struct SearchSlotKey: PreferenceKey {
+    static var defaultValue: CGRect = .zero
+    static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
+        value = nextValue()
+    }
+}
+
+/// The full-screen root hosted inside `LauncherSearchPanel` (a window at a
+/// level ABOVE the menu bar). It draws the search capsule at the slot reported
+/// by the main content window; because the whole hosting layer is scaled each
+/// frame by the animator exactly like the grid layer, the capsule zooms
+/// together with the grid and — being above the menu bar — is never clipped by
+/// the menu-bar strip.
+struct LauncherSearchFieldHost: View {
+    @EnvironmentObject private var store: LauncherStore
+    @EnvironmentObject private var controller: LauncherController
+    @Environment(\.openSettings) private var openSettings
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack {
+                let measured = controller.searchBarSlot
+                let slot: CGRect = measured != .zero
+                    ? measured
+                    // Provisional fallback so the capsule is visible even before
+                    // the first measurement lands (then it snaps to the measured
+                    // slot, which is authoritative).
+                    : CGRect(x: (proxy.size.width - 250) / 2,
+                             y: max(0, proxy.size.height * 0.04),
+                             width: 250, height: 42)
+                SearchField(
+                    text: $store.searchText,
+                    isFocused: $focused,
+                    onSubmit: {
+                        if let application = store.filteredApplications.first {
+                            controller.launch(application)
+                        }
+                    },
+                    onSettings: {
+                        openSettings()
+                        controller.presentSettingsAboveLauncher()
+                    }
+                )
+                .frame(width: slot.width, height: slot.height)
+                .position(x: slot.midX, y: slot.midY)
+                .opacity(store.openFolderID == nil ? 1 : 0)
+                .allowsHitTesting(store.openFolderID == nil)
+                .animation(.spring(response: 0.3, dampingFraction: 0.85), value: store.openFolderID)
+            }
+            .frame(width: proxy.size.width, height: proxy.size.height)
+        }
+        .preferredColorScheme(.dark)
+        .onAppear { focused = true }
+        .onChange(of: controller.isPresented) { _, presented in
+            guard presented else { return }
+            // `.onAppear` fires only when the view is first mounted, so a
+            // re-invoked launcher wouldn't re-focus the field. `show()` flips
+            // `isPresented` before the search panel is made key, so defer
+            // focus to the next main-loop tick.
+            Task { @MainActor in focused = true }
         }
     }
 }
