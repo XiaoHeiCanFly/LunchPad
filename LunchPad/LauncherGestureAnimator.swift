@@ -7,9 +7,8 @@ import QuartzCore
 ///   - `.tracking`: fingers are on the trackpad. The visual follows the finger
 ///     target with a short time-constant exponential low-pass filter — near
 ///     instant follow that still smooths 120 Hz sensor jitter.
-///   - `.settling`: a spring integrates toward 0 (closed) or 1 (open),
-///     producing the native overshoot when opening and a clean scale-down
-///     when closing.
+///   - `.settling`: after release, a spring continues toward 0 (closed) or
+///     1 (open) with the finger's final velocity.
 ///
 /// All visuals are applied by the controller through `onVisualChange` by
 /// mutating CALayer properties directly. The engine never publishes state, so
@@ -28,32 +27,18 @@ final class LauncherGestureAnimator {
     // MARK: - Tunables
 
     /// Full-spread radius change (raw trackpad units) mapping to progress 0→1.
-    /// Tuned so the launcher becomes visible with only a small finger travel —
-    /// a responsive pinch start (see also the fade-in curve in applyVisualChange).
     static let rawSensitivity: CGFloat = 0.095
     /// NSEvent magnification sensitivity (1 / 2.15 — matches the pre-refactor
     /// `-magnification * 2.15` factor).
     static let magnifySensitivity: CGFloat = 0.465
     /// Time constant (seconds) of the tracking low-pass filter.
-    static let followTau: TimeInterval = 0.025
-    /// Progress at/above which releasing settles open.
-    static let openThreshold: CGFloat = 0.35
-    /// For a QUICK spread to commit OPEN, the raw target must reach at least
-    /// this high. Quick gestures are more likely accidental flicks than
-    /// sustained ones, so the bar sits above `openThreshold` — but a fast,
-    /// deliberate large spread still opens instead of snapping shut on release.
-    static let quickOpenThreshold: CGFloat = 0.6
-    /// A contact shorter than this counts as a quick flick. Quick flicks only
-    /// commit when their amplitude is large enough to be deliberate — see
-    /// quickCloseDrop.
-    static let quickGestureDuration: TimeInterval = 0.45
-    /// For a SUSTAINED spread to close, the raw target must drop at least this
-    /// far below the open base (1.0). Small — any deliberate spread closes.
-    static let closeDropEpsilon: CGFloat = 0.02
-    /// For a QUICK spread, the target must drop at least this far below the
-    /// open base to count as a deliberate close. This keeps a quick large
-    /// spread closing while a quick small flick still settles back to open.
-    static let quickCloseDrop: CGFloat = 0.25
+    static let followTau: TimeInterval = 0.016
+    /// Both directions commit after the same fraction of travel. A short
+    /// velocity projection helps a deliberate flick, without changing the
+    /// rules based on how long the fingers have been down.
+    static let commitTravel: CGFloat = 0.35
+    static let projectionTime: TimeInterval = 0.12
+    static let maximumProjection: CGFloat = 0.18
 
     /// Spring for opening (near-critical → fast settle ~0.2s, imperceptible
     /// bounce). The old values (300/38) were over-damped, so the scale crept
@@ -67,10 +52,6 @@ final class LauncherGestureAnimator {
 
     /// Maximum time a settle may run before it is forced to finish.
     static let maxSettleDuration: TimeInterval = 1.1
-    /// Raw MultitouchSupport occasionally misses the final contact frame
-    /// (sleep/wake and display reconfiguration are the common cases). Never
-    /// allow that stale contact to own the animator indefinitely.
-    static let maxTrackingDuration: TimeInterval = 5
     /// A CADisplayLink tied to a display that went away can remain non-nil but
     /// stop delivering frames. Detect that case without delaying an explicit
     /// launcher invocation by seconds.
@@ -85,6 +66,7 @@ final class LauncherGestureAnimator {
     var onGestureBegin: (() -> Void)?
     /// Called once when a settle finishes. `didOpen` reports the result.
     var onSettleComplete: ((Bool) -> Void)?
+    var onGestureRelease: ((CGFloat, CGFloat, CGFloat) -> Void)?
 
     // MARK: - Private state
 
@@ -93,17 +75,23 @@ final class LauncherGestureAnimator {
     /// display link does not migrate when that display is unplugged.
     private var displayID: Int?
     private var baseProgress: CGFloat = 0
-    /// Farthest targets (raw, unfiltered) the fingers reached during tracking.
-    /// Used at release to judge gesture direction without the low-pass lag.
-    private var trackingMinTarget: CGFloat = 0
-    private var trackingMaxTarget: CGFloat = 0
-    private var trackingTargetProvider: (() -> CGFloat)?
-    /// Polled each frame while `.tracking`; returning false ends the gesture.
-    /// Set to `nil` for magnify (release is signaled via `endTracking`).
-    var trackingContactActive: (() -> Bool)?
+    /// Read target and contact lifetime together, so lifting cannot erase the
+    /// last position between two reads. Timestamps use system uptime.
+    struct TrackingSample {
+        var target: CGFloat
+        var timestamp: TimeInterval
+        var contactActive: Bool = true
+    }
+
+    private var trackingTargetProvider: (() -> TrackingSample)?
+    private var restingTarget: CGFloat = 0
+    private var latestTarget: CGFloat = 0
+    private var latestInputTarget: CGFloat = 0
+    private var latestSampleTime: TimeInterval = 0
+    private var fingerVelocity: CGFloat = 0
     private var velocity: CGFloat = 0
-    private var gestureStartTime: Date = .distantPast
-    private var settleStartTime: Date = .distantPast
+    private var lastFrameTime: TimeInterval?
+    private var settleStartTime: TimeInterval = 0
     private var didBeginGesture = false
     private var settleTarget: CGFloat = 0
     /// Invalidates delayed watchdog work whenever a newer transition starts.
@@ -150,65 +138,92 @@ final class LauncherGestureAnimator {
 
     // MARK: - Gesture API
 
-    /// Begin following a trackpad (or magnify) gesture. `base` is the launcher
-    /// state when the gesture starts: 1 if already presented, 0 otherwise.
-    /// `targetProvider` is read once per display frame and must return the
-    /// absolute finger target in [0, 1].
-    func beginTracking(base: CGFloat, targetProvider: @escaping () -> CGFloat) {
+    /// A new contact can catch an in-flight spring at its visible position.
+    /// The previous destination remains the resting state if it is cancelled.
+    func beginTracking(base: CGFloat, targetProvider: @escaping () -> TrackingSample) {
+        let previousDestination: CGFloat
+        if case .settling(let target) = state {
+            previousDestination = target
+        } else {
+            previousDestination = base >= 0.5 ? 1 : 0
+        }
         cancelTransition()
-        baseProgress = base
+        baseProgress = min(1, max(0, base))
+        restingTarget = previousDestination
         trackingTargetProvider = targetProvider
-        trackingMinTarget = base
-        trackingMaxTarget = base
+        latestTarget = baseProgress
+        latestInputTarget = baseProgress
+        latestSampleTime = 0
+        fingerVelocity = 0
         velocity = 0
-        gestureStartTime = Date()
         didBeginGesture = false
         state = .tracking
         resumeLink()
+        // Contact lifetime owns tracking. In particular, a slow gesture or a
+        // stationary hold must never be completed by a fixed-duration timer.
+    }
+
+    /// Consume the terminal sample before making a decision. The last sensor
+    /// update may arrive after the last display frame, including a fast pinch
+    /// that begins and ends between two frames.
+    func endTracking(cancelled: Bool = false, at now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        guard state == .tracking else { return }
         let generation = transitionGeneration
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.maxTrackingDuration) { [weak self] in
-            guard let self,
-                  self.transitionGeneration == generation,
-                  self.state == .tracking else { return }
-            // Treat an abnormally long raw contact as released. endTracking()
-            // retains the normal threshold/direction decision, so recovery is
-            // visually identical to lifting the fingers.
-            self.endTracking()
+        if let sample = trackingTargetProvider?() { record(sample) }
+        guard state == .tracking, transitionGeneration == generation else { return }
+        let releaseVelocity = currentFingerVelocity(at: now)
+        let projected = latestTarget + min(Self.maximumProjection, max(-Self.maximumProjection,
+            releaseVelocity * Self.projectionTime))
+        let destination: CGFloat
+        if cancelled || !didBeginGesture {
+            destination = restingTarget
+        } else if restingTarget > 0.5 {
+            destination = projected <= 1 - Self.commitTravel ? 0 : 1
+        } else {
+            destination = projected >= Self.commitTravel ? 1 : 0
+        }
+        onGestureRelease?(latestTarget, releaseVelocity, destination)
+        guard state == .tracking, transitionGeneration == generation else { return }
+        beginSettling(to: destination, initialVelocity: cancelled ? 0 : releaseVelocity)
+    }
+
+    private func record(_ sample: TrackingSample) {
+        guard sample.target.isFinite, sample.timestamp.isFinite,
+              sample.timestamp >= latestSampleTime else { return }
+        // Discard travel beyond either endpoint. Reversing a fully open or
+        // closed gesture must respond immediately, without unwinding an
+        // invisible amount of extra pinch/spread first.
+        let target = min(1, max(0, latestTarget + sample.target - latestInputTarget))
+        if latestSampleTime > 0, sample.timestamp > latestSampleTime {
+            let dt = sample.timestamp - latestSampleTime
+            // Filter sensor velocity, not visual lag. Long holds discard old
+            // momentum; tiny intervals cannot turn jitter into a huge fling.
+            let measured = (target - latestTarget) / max(1.0 / 240.0, dt)
+            let k = 1 - exp(-dt / 0.04)
+            fingerVelocity += (min(4, max(-4, measured)) - fingerVelocity) * k
+        }
+        latestTarget = target
+        latestInputTarget = sample.target
+        latestSampleTime = sample.timestamp
+        if !didBeginGesture, abs(target - baseProgress) >= 0.02 {
+            didBeginGesture = true
+            onGestureBegin?()
         }
     }
 
-    /// Called when the fingers lift. Judged by how far the raw target moved:
-    /// a spread while open closes (a quick spread needs a large enough drop to
-    /// count as deliberate, a sustained spread closes on any real movement);
-    /// a pinch while closed opens once it reaches openThreshold. A quick pinch
-    /// never commits.
-    func endTracking() {
-        guard state == .tracking else { return }
-        let isQuick = Date().timeIntervalSince(gestureStartTime) < Self.quickGestureDuration
-        if baseProgress > 0.5 {
-            // Spread to close while open. The close threshold is intentionally
-            // removed — amplitude decides, not magnitude:
-            //   - sustained: any real spread closes
-            //   - quick: must spread far enough to be deliberate, not a flick
-            let dropped = baseProgress - trackingMinTarget
-            let minimum = isQuick ? Self.quickCloseDrop : Self.closeDropEpsilon
-            beginSettling(to: dropped >= minimum ? 0 : 1)
-        } else if isQuick {
-            // A quick spread commits to open only when it is large enough to be
-            // deliberate (a quick small flick is likely accidental). Previously
-            // a quick gesture NEVER committed, so a fast, large spread animated
-            // most of the way open and then snapped shut on release.
-            beginSettling(to: trackingMaxTarget >= Self.quickOpenThreshold ? 1 : 0)
-        } else {
-            beginSettling(to: trackingMaxTarget >= Self.openThreshold ? 1 : 0)
-        }
+    private func currentFingerVelocity(at now: TimeInterval) -> CGFloat {
+        // Keep momentum across the brief contact-loss grace, but do not fling
+        // after the user has stopped moving and held the gesture in place.
+        let age = max(0, now - latestSampleTime - 0.08)
+        return fingerVelocity * exp(-age / 0.04)
     }
 
     /// Spring from the current progress to `target` (0 or 1).
-    func beginSettling(to target: CGFloat) {
+    func beginSettling(to target: CGFloat, initialVelocity: CGFloat = 0) {
         cancelTransition()
+        velocity = initialVelocity
         settleTarget = target
-        settleStartTime = Date()
+        settleStartTime = ProcessInfo.processInfo.systemUptime
         state = .settling(target: target)
         resumeLink()
         let generation = transitionGeneration
@@ -255,38 +270,48 @@ final class LauncherGestureAnimator {
     // MARK: - Display link
 
     @objc private func tick(_ link: CADisplayLink) {
-        let dt = max(1.0 / 120.0, link.duration)
+        let now = ProcessInfo.processInfo.systemUptime
+        let interval = link.targetTimestamp - link.timestamp
+        advanceFrame(at: now, duration: interval > 0 ? interval : 1.0 / 60.0)
+    }
+
+    /// Also used by deterministic gesture replay tests, without a display.
+    func advanceFrame(at now: TimeInterval, duration: TimeInterval) {
+        let dt = min(1.0 / 15.0, max(1.0 / 240.0, lastFrameTime.map { now - $0 } ?? duration))
+        lastFrameTime = now
         switch state {
         case .tracking:
-            if let active = trackingContactActive, !active() {
-                endTracking()
+            let generation = transitionGeneration
+            guard let sample = trackingTargetProvider?() else {
+                endTracking(at: now)
                 return
             }
-            guard let provider = trackingTargetProvider else {
-                endTracking()
+            record(sample)
+            // Preparing windows may cancel tracking during a screen change.
+            // Do not let an old display frame overwrite that transition.
+            guard state == .tracking, transitionGeneration == generation else { return }
+            if !sample.contactActive {
+                endTracking(at: now)
                 return
             }
-            let target = min(1, max(0, provider()))
-            trackingMinTarget = min(trackingMinTarget, target)
-            trackingMaxTarget = max(trackingMaxTarget, target)
             let k = 1 - exp(-dt / Self.followTau)
-            let previous = visualProgress
-            visualProgress += (target - visualProgress) * k
-            velocity = (visualProgress - previous) / dt
-            if !didBeginGesture, abs(target - baseProgress) >= 0.02 {
-                didBeginGesture = true
-                onGestureBegin?()
-            }
+            visualProgress += (latestTarget - visualProgress) * k
             onVisualChange?(visualProgress)
 
         case .settling(let target):
             let stiffness = target > 0 ? Self.openStiffness : Self.closeStiffness
             let damping = target > 0 ? Self.openDamping : Self.closeDamping
-            let acceleration = -stiffness * (visualProgress - target) - damping * velocity
-            velocity += acceleration * dt
-            visualProgress += velocity * dt
+            // Bounded substeps keep the spring stable on dropped frames and
+            // low-refresh displays as well as 120 Hz ProMotion.
+            let steps = max(1, Int(ceil(dt / (1.0 / 120.0))))
+            let step = dt / Double(steps)
+            for _ in 0..<steps {
+                let acceleration = -stiffness * (visualProgress - target) - damping * velocity
+                velocity += acceleration * step
+                visualProgress += velocity * step
+            }
             onVisualChange?(visualProgress)
-            if Date().timeIntervalSince(settleStartTime) > Self.maxSettleDuration
+            if now - settleStartTime > Self.maxSettleDuration
                 || (abs(visualProgress - target) < 0.003 && abs(velocity) < 0.15) {
                 finishSettling()
             }
@@ -303,7 +328,7 @@ final class LauncherGestureAnimator {
         state = .idle
         transitionGeneration &+= 1
         trackingTargetProvider = nil
-        trackingContactActive = nil
+        lastFrameTime = nil
         pauseLink()
         onVisualChange?(settleTarget)
         onSettleComplete?(didOpen)
@@ -313,7 +338,7 @@ final class LauncherGestureAnimator {
         transitionGeneration &+= 1
         state = .idle
         trackingTargetProvider = nil
-        trackingContactActive = nil
+        lastFrameTime = nil
         pauseLink()
     }
 

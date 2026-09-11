@@ -9,87 +9,6 @@ private typealias MTDeviceCreateDefaultFunction = @convention(c) () -> MTDeviceR
 private typealias MTRegisterContactFrameCallbackFunction = @convention(c) (MTDeviceRef?, MTContactCallback) -> Void
 private typealias MTDeviceStartFunction = @convention(c) (MTDeviceRef?, Int32) -> Void
 
-/// Thread-safe gesture contact state written by the raw-trackpad callback
-/// thread and read by the main-thread display-link animator.
-///
-/// There are no main-thread hops for data: the callback only writes these
-/// locked values and the animator samples them every display frame, so frame
-/// delivery stays synchronized to VSYNC.
-nonisolated final class TrackpadContactState: @unchecked Sendable {
-    static let shared = TrackpadContactState()
-
-    private let lock = NSLock()
-    private var startRadius: CGFloat?
-    private var latestRadius: CGFloat = 0
-    private var contactIsActive = false
-    private var needsWakeup = false
-    private var lastFourFingerFrameUptime: TimeInterval = 0
-
-    /// MultitouchSupport briefly reports 3/5 contacts while four fingers are
-    /// landing or lifting. Ending on the first such frame makes a valid pinch
-    /// close again within one display tick. Preserve the contact across a few
-    /// sensor frames, while keeping release latency below a tenth of a second.
-    private static let contactLossGrace: TimeInterval = 0.075
-
-    /// Total radius change since the contact began (startRadius − latest).
-    /// Positive = fingers moving together, negative = spreading.
-    var motion: CGFloat {
-        lock.lock(); defer { lock.unlock() }
-        guard let startRadius else { return 0 }
-        return startRadius - latestRadius
-    }
-
-    var contactActive: Bool {
-        lock.lock(); defer { lock.unlock() }
-        expireContactIfNeededLocked(now: ProcessInfo.processInfo.systemUptime)
-        return contactIsActive
-    }
-
-    /// Whether a new four-finger contact began since the last consume. Used to
-    /// dispatch a single main-thread wakeup per gesture; the display link then
-    /// takes over per-frame sampling.
-    func consumeNeedsWakeup() -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        let value = needsWakeup
-        needsWakeup = false
-        return value
-    }
-
-    func updateContact(radius: CGFloat) {
-        lock.lock()
-        let now = ProcessInfo.processInfo.systemUptime
-        expireContactIfNeededLocked(now: now)
-        if !contactIsActive {
-            // Transition into a new contact: record the baseline.
-            contactIsActive = true
-            startRadius = radius
-            latestRadius = radius
-            needsWakeup = true
-        } else {
-            latestRadius = radius
-        }
-        lastFourFingerFrameUptime = now
-        lock.unlock()
-    }
-
-    func endContact() {
-        lock.lock()
-        // Do not tear down on a single noisy non-four-finger frame. Repeated
-        // frames, or the animator's next contactActive poll, expire it after
-        // the short grace period above.
-        expireContactIfNeededLocked(now: ProcessInfo.processInfo.systemUptime)
-        lock.unlock()
-    }
-
-    private func expireContactIfNeededLocked(now: TimeInterval) {
-        guard contactIsActive,
-              now - lastFourFingerFrameUptime > Self.contactLossGrace else { return }
-        contactIsActive = false
-        startRadius = nil
-        latestRadius = 0
-    }
-}
-
 /// Tracks system-gesture suppression and four-finger contact so the CGEvent
 /// tap can block Mission Control / spaces while a pinch is in progress.
 private nonisolated final class TrackpadSystemGestureGate: @unchecked Sendable {
@@ -122,9 +41,10 @@ nonisolated private func lunchPadTrackpadContactCallback(
     _ timestamp: Double,
     _ frame: Int32
 ) {
+    let now = ProcessInfo.processInfo.systemUptime
     guard let contacts, contactCount == 4 else {
         TrackpadSystemGestureGate.shared.suppress(for: 0.6)
-        TrackpadContactState.shared.endContact()
+        TrackpadContactState.shared.endContact(contactCount: Int(contactCount), at: now)
         return
     }
 
@@ -152,14 +72,13 @@ nonisolated private func lunchPadTrackpadContactCallback(
     }
     radius /= 4
 
-    TrackpadContactState.shared.updateContact(radius: radius)
-
     // Wake the main-thread animator once per contact sequence. This is a
-    // single hop per gesture — never per frame.
-    if TrackpadContactState.shared.consumeNeedsWakeup() {
+    // single hop per gesture — never per frame. The generation prevents a
+    // delayed wakeup from attaching itself to a later set of fingers.
+    if let generation = TrackpadContactState.shared.updateContact(radius: radius, at: now) {
         DispatchQueue.main.async {
             MainActor.assumeIsolated {
-                LauncherController.shared.rawTrackpadGestureBegan()
+                LauncherController.shared.rawTrackpadGestureBegan(generation: generation)
             }
         }
     }
@@ -173,6 +92,7 @@ final class RawTrackpadGestureMonitor {
 
     private var frameworkHandle: UnsafeMutableRawPointer?
     private var device: MTDeviceRef?
+    private var sleepObserver: NSObjectProtocol?
 
     private init() {}
 
@@ -196,6 +116,14 @@ final class RawTrackpadGestureMonitor {
         registerCallback(device, lunchPadTrackpadContactCallback)
         startDevice(device, 0)
         isRunning = true
+        sleepObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.willSleepNotification, object: nil, queue: .main
+        ) { _ in
+            MainActor.assumeIsolated {
+                TrackpadContactState.shared.cancelContact()
+                LauncherController.shared.cancelTrackpadGesture()
+            }
+        }
     }
 
     nonisolated static var hasFourFingerContact: Bool {

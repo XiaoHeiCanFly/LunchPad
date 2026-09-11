@@ -42,6 +42,9 @@ jobs:
               raise SystemExit('LunchPad requires the macOS 26.5 SDK or newer.')
           PY
 
+      - name: Replay gesture regressions
+        run: bash scripts/test-gestures.sh
+
       - name: Build universal app
         shell: bash
         env:

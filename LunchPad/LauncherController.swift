@@ -66,11 +66,12 @@ final class LauncherController: ObservableObject {
     private var presentationScreenCenter: CGPoint = .zero
 
     private var isPinching = false
-    /// Gesture progress base: 1 if the launcher was already presented when a
-    /// gesture began, 0 otherwise.
+    /// Visible progress where the current gesture caught the launcher.
     private var baseProgressForGesture: CGFloat = 0
     /// Cumulative NSEvent magnification for the magnify fallback gesture.
     private var magnifyOffset: CGFloat = 0
+    private var magnifyTimestamp: TimeInterval = 0
+    private var rawGestureGeneration: UInt64?
     /// Whether the user's last intent was to show (true) or hide (false).
     /// Set immediately on user action, before animation completes.
     private var showIntent = false
@@ -204,10 +205,12 @@ final class LauncherController: ObservableObject {
         // The launcher and the Dock-hover preview never coexist.
         DockHoverObserver.shared.prepareForLauncherPresentation()
         showIntent = true
+        isPinching = false
+        rawGestureGeneration = nil
         // Defensive: if a drag was interrupted without ever reaching a drop,
         // make sure the launcher never reappears with a stuck dragged icon.
         store.endDrag()
-        guard !isPresented || animator.visualProgress < 0.99 else {
+        guard !isPresented || animator.visualProgress < 0.99 || animator.isActive else {
             diagnosticRecord("presentation", "show-skipped id=\(attemptID.uuidString) reason=already-presented \(diagnosticPanelsSummary())")
             schedulePresentationProbes(for: attemptID)
             return
@@ -219,6 +222,7 @@ final class LauncherController: ObservableObject {
             setPresented(false)
             return
         }
+        showIntent = true
         setPresented(true)
         setSpaceSwitchingHotKeysEnabled(true)
         store.optionIsPressed = NSEvent.modifierFlags.contains(.option)
@@ -251,7 +255,12 @@ final class LauncherController: ObservableObject {
         presentationAttemptID = UUID()
         diagnosticRecord("presentation", "hide-request animated=\(animated) presented=\(isPresented) progress=\(diagnosticNumber(animator.visualProgress)) panels=\(panels.count)")
         showIntent = false
-        guard isPresented else { return }
+        isPinching = false
+        rawGestureGeneration = nil
+        guard isPresented else {
+            animator.snap(to: 0)
+            return
+        }
         if animated {
             animator.beginSettling(to: 0)
         } else {
@@ -396,12 +405,12 @@ final class LauncherController: ObservableObject {
             // The grid/search arrive oversized (1 + arriveOvershoot) and settle
             // to 1.0 while fading in; closing grows back out while fading. Clamp
             // progress to [0, 1] so a spring overshoot can never push the scale
-            // below its final size. Fade-in starts almost immediately (~5%) and
-            // completes near 50%, so the launcher reads as "started" with very
-            // little finger travel while still tracking.
+            // below its final size. Opacity uses the full gesture range, so
+            // closing responds immediately and visible completion matches
+            // the position used by the release decision.
             let p = min(1, max(0, progress))
             scale = 1 + Self.arriveOvershoot * (1 - p)
-            opacity = min(1, max(0, (p - 0.05) / 0.5))
+            opacity = p
         }
         // The menu-bar cover sits over the (dark, busy) system menu bar rather
         // than the desktop wallpaper, so the same numeric alpha reads as LESS
@@ -499,10 +508,12 @@ final class LauncherController: ObservableObject {
         lastDiagnosticsProgressBucket = -1
         diagnosticRecord("gesture", "prepare-presentation id=\(attemptID.uuidString) progress=\(diagnosticNumber(animator.visualProgress))")
         DockHoverObserver.shared.prepareForLauncherPresentation()
-        preparePresentationPanelsIfNeeded()
+        // Panels are prepared before tracking starts. Rebuilding here would
+        // snap the animator from inside its own onGestureBegin callback.
         guard !panels.isEmpty else {
             diagnosticRecord("error", "gesture-no-panels id=\(attemptID.uuidString) mode=\(displayMode)")
             isPinching = false
+            animator.snap(to: 0)
             return
         }
         setPresented(true)
@@ -520,20 +531,33 @@ final class LauncherController: ObservableObject {
 
     /// Main-thread entry point for a new four-finger contact (one hop per
     /// gesture from the raw-trackpad callback thread).
-    func rawTrackpadGestureBegan() {
-        guard !animator.isTracking else {
-            diagnosticRecord("gesture", "raw-begin-skipped reason=already-tracking")
-            return
-        }
-        diagnosticRecord("gesture", "raw-begin presented=\(isPresented) progress=\(diagnosticNumber(animator.visualProgress))")
+    func rawTrackpadGestureBegan(generation: UInt64) {
+        // Queued wakeups can outlive their contact if the main thread was
+        // busy. Never bind an old begin to a newer sequence's radius.
+        guard let initial = TrackpadContactState.shared.snapshot(),
+              initial.generation == generation,
+              rawGestureGeneration != generation else { return }
+        if animator.isTracking { animator.endTracking() }
+        if !isPresented { preparePresentationPanelsIfNeeded() }
+        guard !panels.isEmpty else { return }
+        diagnosticRecord("gesture", "raw-begin generation=\(generation) presented=\(isPresented) progress=\(diagnosticNumber(animator.visualProgress))")
         isPinching = true
-        baseProgressForGesture = isPresented ? 1 : 0
-        animator.beginTracking(base: baseProgressForGesture) { [weak self] in
-            guard let self else { return 0 }
-            return self.baseProgressForGesture
-                + TrackpadContactState.shared.motion / LauncherGestureAnimator.rawSensitivity
+        rawGestureGeneration = generation
+        baseProgressForGesture = min(1, max(0, animator.visualProgress))
+        let base = baseProgressForGesture
+        animator.beginTracking(base: base) {
+            let sample = TrackpadContactState.shared.snapshot(for: generation)
+            return LauncherGestureAnimator.TrackingSample(
+                target: base + (sample?.motion ?? initial.motion) / LauncherGestureAnimator.rawSensitivity,
+                timestamp: sample?.timestamp ?? initial.timestamp,
+                contactActive: sample?.contactActive ?? false
+            )
         }
-        animator.trackingContactActive = { TrackpadContactState.shared.contactActive }
+    }
+
+    func cancelTrackpadGesture() {
+        guard animator.isTracking else { return }
+        hide(animated: false)
     }
 
     private func setupAnimator() {
@@ -542,6 +566,11 @@ final class LauncherController: ObservableObject {
         }
         animator.onGestureBegin = { [weak self] in
             self?.prepareGesturePresentation()
+        }
+        animator.onGestureRelease = { [weak self] progress, velocity, target in
+            guard let self else { return }
+            self.showIntent = target > 0.5
+            self.diagnosticRecord("gesture", "release progress=\(self.diagnosticNumber(progress)) velocity=\(self.diagnosticNumber(velocity)) target=\(Int(target))")
         }
         animator.onSettleComplete = { [weak self] didOpen in
             self?.handleSettleComplete(didOpen)
@@ -552,6 +581,8 @@ final class LauncherController: ObservableObject {
     private func handleSettleComplete(_ didOpen: Bool) {
         diagnosticRecord("animation", "settle-complete opened=\(didOpen) progress=\(diagnosticNumber(animator.visualProgress)) \(diagnosticPanelsSummary())")
         isPinching = false
+        rawGestureGeneration = nil
+        showIntent = didOpen
         if !didOpen {
             resetAndFinishHide()
         }
@@ -560,20 +591,34 @@ final class LauncherController: ObservableObject {
     // MARK: - NSEvent magnify (fallback when raw trackpad is unavailable)
 
     private func handleMagnify(_ event: NSEvent) {
-        if event.phase == .began || !animator.isTracking {
+        let ended = event.phase.contains(.ended)
+        let cancelled = event.phase.contains(.cancelled)
+        // A stray end event must not start a second gesture.
+        guard animator.isTracking || (!ended && !cancelled) else { return }
+        if event.phase.contains(.began) || !animator.isTracking {
+            if animator.isTracking { animator.endTracking(cancelled: true) }
+            if !isPresented { preparePresentationPanelsIfNeeded() }
+            guard !panels.isEmpty else { return }
             isPinching = true
             magnifyOffset = 0
-            baseProgressForGesture = isPresented ? 1 : 0
-            animator.beginTracking(base: baseProgressForGesture) { [weak self] in
-                guard let self else { return 0 }
-                return self.baseProgressForGesture
-                    - self.magnifyOffset / LauncherGestureAnimator.magnifySensitivity
+            magnifyTimestamp = event.timestamp
+            baseProgressForGesture = min(1, max(0, animator.visualProgress))
+            let base = baseProgressForGesture
+            animator.beginTracking(base: base) { [weak self] in
+                guard let self else {
+                    return LauncherGestureAnimator.TrackingSample(target: base, timestamp: 0, contactActive: false)
+                }
+                return LauncherGestureAnimator.TrackingSample(
+                    target: base - self.magnifyOffset / LauncherGestureAnimator.magnifySensitivity,
+                    timestamp: self.magnifyTimestamp
+                )
             }
-            animator.trackingContactActive = nil
         }
-        magnifyOffset = CGFloat(event.magnification)
-        if event.phase == .ended || event.phase == .cancelled {
-            animator.endTracking()
+        // NSEvent supplies a delta for each event, not cumulative travel.
+        magnifyOffset += CGFloat(event.magnification)
+        magnifyTimestamp = event.timestamp
+        if ended || cancelled {
+            animator.endTracking(cancelled: cancelled)
         }
     }
 
@@ -967,6 +1012,8 @@ final class LauncherController: ObservableObject {
         animator.snap(to: 0)
         setPresented(false)
         showIntent = false
+        isPinching = false
+        rawGestureGeneration = nil
         store.resetAdaptiveGrid()
         refreshDisplayOptions()
         guard let screen = presentationScreen() else {

@@ -8,7 +8,7 @@
 - 全屏、多显示器覆盖层；动态壁纸模糊、Liquid Glass 搜索框/分页器/文件夹
 - 多显示器只呈现一个启动台，可选择跟随鼠标所在的活动显示器或固定到指定显示器
 - F4 全局热键，并兼容旧键盘的 `NX_KEYTYPE_LAUNCH_PANEL` 媒体键
-- 全局捏合打开、反向捏合关闭；透明度、缩放和模糊直接跟随手势进度
+- 全局捏合打开、反向捏合关闭；透明度和缩放持续跟随手指，停顿不会自动完成；松手按当前位置与速度收尾，可中途反向撤回
 - 不使用固定 60Hz 定时器，交互由窗口所在屏幕的原生合成节拍呈现，可适配 120Hz ProMotion
 - 鼠标拖拽、触控板滑动、滚轮、鼠标侧键和 `⌘←` / `⌘→` 翻页；拖页过程跟手
 - 方向键选择、Return 打开、Esc 分层退出；自动记住最后页
@@ -65,7 +65,7 @@ bash scripts/package-dmg.sh /path/to/LunchPad.app /path/to/output
 
 ## 系统 API 边界
 
-辅助功能授权后，LunchPad 可在其他应用处于前台时通过全局 `NSEvent` 监视器接收捏合进度和 Option 键状态。公开事件提供连续的 magnification 与 phase，但不提供触点数量，因此具体手指数仍由系统触控板映射决定。项目没有使用私有 MultitouchSupport API，便于后续签名、公证和分发。
+辅助功能授权后，LunchPad 使用私有 `MultitouchSupport` 回调读取四指触点，以便在其他应用处于前台时连续跟随捏合；窗口内保留 `NSEvent` magnify 后备路径。全局 `NSEvent` 监视器负责系统按键与 Option 键状态。手势实现依赖私有触点记录格式，需要在系统升级时实机验证。行为说明、自动回放命令与实机检查见 [手势验证](docs/GESTURE-VALIDATION.md)。
 
 开机启动使用 `SMAppService.mainApp`，要求应用经过代码签名；Xcode 正常运行或归档的签名构建可直接注册，使用 `CODE_SIGNING_ALLOWED=NO` 生成的临时调试包只能验证界面与编译。
 
