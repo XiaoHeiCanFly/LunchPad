@@ -109,6 +109,25 @@ nonisolated func _SLPSSetFrontProcessWithOptions(_ psn: UnsafeMutablePointer<Pro
     return fn(psn, wid, mode)
 }
 
+typealias SLPSPostEventRecordToType = @convention(c) (
+    UnsafeMutableRawPointer,
+    UnsafeMutablePointer<UInt8>
+) -> CGError
+
+nonisolated private let postEventRecordPtr: SLPSPostEventRecordToType? = {
+    guard let handle = skyLightHandle,
+          let symbol = dlsym(handle, "SLPSPostEventRecordTo") else { return nil }
+    return unsafeBitCast(symbol, to: SLPSPostEventRecordToType.self)
+}()
+
+/// Posts a synthetic event record to the Window Server for the given process.
+/// Used to make a window key; `SLPSSetFrontProcessWithOptions` alone fronts the
+/// process but the destination Space restores its previous frontmost app.
+nonisolated func SLPSPostEventRecordTo(_ psn: UnsafeMutablePointer<ProcessSerialNumber>, _ bytes: UnsafeMutablePointer<UInt8>) -> CGError {
+    guard let fn = postEventRecordPtr else { return CGError(rawValue: -1)! }
+    return fn(psn, bytes)
+}
+
 // MARK: - Dock position
 
 enum DockPosition {
@@ -451,6 +470,7 @@ extension PreviewWindow {
                 app.activate()
                 bringToFront()
                 isMinimized = false
+                WindowThumbnailCache.shared.invalidate(windowID: id)
                 return false
             } catch {
                 return nil
@@ -459,6 +479,7 @@ extension PreviewWindow {
             do {
                 try axElement.setAttribute(kAXMinimizedAttribute, true)
                 isMinimized = true
+                WindowThumbnailCache.shared.invalidate(windowID: id)
                 return true
             } catch {
                 return nil
@@ -478,6 +499,7 @@ extension PreviewWindow {
                 bringToFront()
             }
             isHidden = newHiddenState
+            WindowThumbnailCache.shared.invalidate(windowID: id)
             return newHiddenState
         } catch {
             return nil
@@ -493,6 +515,7 @@ extension PreviewWindow {
             do {
                 try axElement.setAttribute(kAXFullscreenAttribute, newValue)
                 isFullscreen = newValue
+                WindowThumbnailCache.shared.invalidate(windowID: id)
                 return newValue
             } catch {
                 return nil
@@ -505,6 +528,7 @@ extension PreviewWindow {
     @MainActor
     func closeWindow() {
         guard let closeButton else { return }
+        WindowThumbnailCache.shared.invalidate(windowID: id)
         try? closeButton.performAction(kAXPressAction)
     }
 
@@ -520,9 +544,76 @@ extension PreviewWindow {
         _ = GetProcessForPID(app.processIdentifier, &psn)
         _ = _SLPSSetFrontProcessWithOptions(&psn, UInt32(id), SLPSMode.userGenerated.rawValue)
 
+        // Synthetic click makes the window key and triggers the user-generated
+        // Space switch. SLPSSetFrontProcessWithOptions alone fronts the process,
+        // but on the destination Space macOS restores that Space's previous
+        // frontmost app and re-covers the target. No NSRunningApplication.activate
+        // here either — it is cooperative and does not stick.
+        PreviewWindowUtil.makeKeyWindow(&psn, windowID: id)
+
         try? axElement.performAction(kAXRaiseAction)
         try? axElement.setAttribute(kAXMainWindowAttribute, true)
-        app.activate(options: [.activateAllWindows])
+    }
+}
+
+// MARK: - Window thumbnail cache
+
+/// Short-lived cache of captured window snapshots, keyed by `CGWindowID`.
+///
+/// Dock hover previews re-open frequently as the pointer slides between Dock
+/// icons, and adjacent hovers usually land on the same app whose windows have
+/// not changed. Reusing a snapshot captured within the TTL avoids redundant
+/// `CGSHWCaptureWindowList` calls, which macOS counts toward the "Screen
+/// Recording" access total. `NSCache` bounds memory (cost = image bytes) and
+/// evicts under pressure; the stored timestamp drops entries older than `ttl`.
+nonisolated final class WindowThumbnailCache: @unchecked Sendable {
+    static let shared = WindowThumbnailCache()
+
+    private final class Entry {
+        let image: CGImage
+        let pid: pid_t
+        let capturedAt: TimeInterval
+        init(image: CGImage, pid: pid_t, capturedAt: TimeInterval) {
+            self.image = image
+            self.pid = pid
+            self.capturedAt = capturedAt
+        }
+    }
+
+    private let cache = NSCache<NSNumber, Entry>()
+
+    /// Snapshots older than this are considered stale. Two seconds covers the
+    /// common "slide off and back onto the same Dock icon" round trip without
+    /// serving visibly outdated content for long.
+    private let ttl: TimeInterval = 2.0
+
+    private init() {
+        cache.countLimit = 64
+        cache.totalCostLimit = 64 * 1024 * 1024
+    }
+
+    func image(for windowID: CGWindowID, pid: pid_t) -> CGImage? {
+        let key = NSNumber(value: windowID)
+        guard let entry = cache.object(forKey: key) else { return nil }
+        guard entry.pid == pid,
+              ProcessInfo.processInfo.systemUptime - entry.capturedAt <= ttl
+        else {
+            cache.removeObject(forKey: key)
+            return nil
+        }
+        return entry.image
+    }
+
+    func store(_ image: CGImage, windowID: CGWindowID, pid: pid_t) {
+        cache.setObject(
+            Entry(image: image, pid: pid, capturedAt: ProcessInfo.processInfo.systemUptime),
+            forKey: NSNumber(value: windowID),
+            cost: image.bytesPerRow * image.height
+        )
+    }
+
+    func invalidate(windowID: CGWindowID) {
+        cache.removeObject(forKey: NSNumber(value: windowID))
     }
 }
 
@@ -532,6 +623,25 @@ enum PreviewWindowUtil {
     /// Whether screen capture is permitted (CGSHWCaptureWindowList requires it).
     nonisolated static func shouldCaptureWindowImages() -> Bool {
         CGPreflightScreenCaptureAccess()
+    }
+
+    /// Makes a window key by posting a synthetic left-click (down then up) to
+    /// the Window Server. Ported from DockDoor, which in turn ports it from
+    /// Hammerspoon. The click lands just outside the frame so the window becomes
+    /// key without hit-testing its content (a top-left hit would close Chrome
+    /// PWA shims).
+    nonisolated static func makeKeyWindow(_ psn: inout ProcessSerialNumber, windowID: CGWindowID) {
+        var bytes = [UInt8](repeating: 0, count: 0x100)
+        bytes[0x04] = 0xF8
+        bytes[0x3A] = 0x10
+        var wid = UInt32(windowID)
+        memcpy(&bytes[0x3C], &wid, MemoryLayout<UInt32>.size)
+        var point = CGPoint(x: -1, y: -1)
+        memcpy(&bytes[0x20], &point, MemoryLayout<CGPoint>.size)
+        bytes[0x08] = 0x01
+        _ = SLPSPostEventRecordTo(&psn, &bytes)
+        bytes[0x08] = 0x02
+        _ = SLPSPostEventRecordTo(&psn, &bytes)
     }
 
     /// Captures a single window by CGWindowID using the CGS hardware capture API.
@@ -842,11 +952,16 @@ enum PreviewWindowUtil {
         // 最小化/隐藏的窗口也尝试截图：CGS 硬件捕获能取到部分最小化窗口
         // 的内容，失败时卡片自然回退到占位图。
         if captureImage {
-            image = try? await captureWindowImage(
+            if let cached = WindowThumbnailCache.shared.image(for: windowID, pid: app.processIdentifier) {
+                image = cached
+            } else if let captured = try? await captureWindowImage(
                 windowID: windowID,
                 pid: app.processIdentifier,
                 expectedSize: expectedCaptureSize
-            )
+            ) {
+                WindowThumbnailCache.shared.store(captured, windowID: windowID, pid: app.processIdentifier)
+                image = captured
+            }
         }
 
         return PreviewWindow(
