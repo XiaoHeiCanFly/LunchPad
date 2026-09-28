@@ -171,22 +171,29 @@ private struct PagesGrid: View {
                     if abs(pageIndex - store.currentPage) <= 1 {
                         LazyVGrid(columns: metrics.gridItems, spacing: 6) {
                             ForEach(Array(page.enumerated()), id: \.element.id) { position, entry in
-                                LauncherTile(
-                                    entry: entry,
-                                    iconSize: metrics.iconSize,
-                                    tileWidth: metrics.cellWidth,
-                                    store: store,
-                                    controller: controller,
-                                    isDragged: store.draggedEntryID == entry.id,
-                                    isDragTarget: store.dragTargetID == entry.id && store.draggedEntryID != entry.id,
-                                    isFolderCandidate: store.folderCandidateID == entry.id && store.draggedEntryID != entry.id,
-                                    isSelected: store.selectedEntryID == entry.id,
-                                    optionIsPressed: store.optionIsPressed,
-                                    dragHoverProgress: store.draggedEntryID == entry.id
-                                        ? store.folderHoverProgress
-                                        : 0
-                                )
-                                .equatable()
+                                if let download = store.download(for: entry) {
+                                    // Downloads are display-only: no drag, no
+                                    // drop, no context menu — nothing that
+                                    // could treat them like installed apps.
+                                    DownloadTile(download: download, iconSize: metrics.iconSize)
+                                } else {
+                                    LauncherTile(
+                                        entry: entry,
+                                        iconSize: metrics.iconSize,
+                                        tileWidth: metrics.cellWidth,
+                                        store: store,
+                                        controller: controller,
+                                        isDragged: store.draggedEntryID == entry.id,
+                                        isDragTarget: store.dragTargetID == entry.id && store.draggedEntryID != entry.id,
+                                        isFolderCandidate: store.folderCandidateID == entry.id && store.draggedEntryID != entry.id,
+                                        isSelected: store.selectedEntryID == entry.id,
+                                        optionIsPressed: store.optionIsPressed,
+                                        dragHoverProgress: store.draggedEntryID == entry.id
+                                            ? store.folderHoverProgress
+                                            : 0
+                                    )
+                                    .equatable()
+                                }
                             }
                         }
                         .padding(.horizontal, 22)
@@ -328,7 +335,7 @@ struct ContentView: View {
                             // (a narrow query leaves most of the page to be
                             // recreated); it simply reappears. The search grid
                             // overlays it on top.
-                            pagedGrid(entries: store.displayEntries)
+                            pagedGrid(entries: store.gridEntries)
                                 .opacity(store.searchText.isEmpty ? 1 : 0)
                                 .allowsHitTesting(store.searchText.isEmpty)
                             if !store.searchText.isEmpty {
@@ -561,6 +568,14 @@ struct UninstallConfirmationView: View {
         groups.flatMap(\.files).filter { selectedFileIDs.contains($0.id) }
     }
 
+    /// Live check: a protected path in the current selection that the app
+    /// cannot delete without Full Disk Access (verified: admin `rm` is denied
+    /// there too, so warn before the user starts).
+    private var showsDiskAccessWarning: Bool {
+        guard !isScanning, !LauncherStore.hasFullDiskAccess() else { return false }
+        return selectedFiles.contains { LauncherStore.isSystemProtectedPath($0.url) }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             HStack(spacing: 14) {
@@ -668,6 +683,30 @@ struct UninstallConfirmationView: View {
             }
             .frame(height: 330)
             .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 12))
+
+            if showsDiskAccessWarning {
+                HStack(alignment: .center, spacing: 10) {
+                    Image(systemName: "lock.shield.fill")
+                        .font(.title3)
+                        .foregroundStyle(.orange)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("未授予「完全磁盘访问」，勾选的沙盒容器将无法删除")
+                            .font(.footnote.weight(.medium))
+                        Text("系统设置 → 隐私与安全性 → 完全磁盘访问，开启 LunchPad 后再删除")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 8)
+                    Button("打开系统设置") {
+                        NSWorkspace.shared.open(URL(
+                            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+                        )!)
+                    }
+                    .controlSize(.small)
+                }
+                .padding(10)
+                .background(.orange.opacity(0.14), in: RoundedRectangle(cornerRadius: 10))
+            }
 
             HStack {
                 Text(isScanning ? "正在计算…" : "将同时处理 \(selectedFiles.count) 个关联项目")
@@ -1197,6 +1236,147 @@ private struct LauncherTile: View, Equatable {
         case .folder(let folder):
             withAnimation(.snappy(duration: 0.3)) { store.openFolder(folder) }
         }
+    }
+}
+
+/// An App Store download in flight: dimmed artwork with a pie-style progress
+/// slice in the middle and the phase ("下载中"/"安装中") below — the icon
+/// itself identifies the app. No interaction a real tile has: no drag, drop,
+/// context menu, or activation.
+private struct DownloadTile: View {
+    let download: AppStoreDownload
+    let iconSize: CGFloat
+    /// 完成后的揭示动画：透明圆从饼图大小放大到抹掉整块遮罩。
+    @State private var revealed = false
+
+    var body: some View {
+        VStack(spacing: 8) {
+            ZStack {
+                artwork
+                // 统一压暗一整层；进度扇形和完成后的圆都是这层遮罩上的
+                // “挖孔”——孔内露出未压暗的原图，孔外与整体遮罩同厚。
+                Rectangle()
+                    .fill(.black.opacity(0.46))
+                    .mask { artwork }
+                    .mask {
+                        // 挖孔 = 整矩形减去扇形（even-odd）：孔内露出原图。
+                        WedgeMask(fraction: download.isFinished ? 1 : (download.fraction ?? 0))
+                            .fill(style: FillStyle(eoFill: true))
+                            .animation(.linear(duration: 0.2),
+                                       value: download.isFinished ? 1.0 : (download.fraction ?? 0))
+                    }
+                    .mask {
+                        RevealMask(progress: revealed ? 1 : 0)
+                            .fill(style: FillStyle(eoFill: true))
+                    }
+                if download.fraction == nil, !download.isFinished, download.phase == .installing {
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .controlSize(.small)
+                        .tint(.white)
+                }
+            }
+            .frame(width: iconSize, height: iconSize)
+            .onChange(of: download.isFinished) { _, finished in
+                guard finished else { return }
+                // 扇形先用 0.2s 补成整圆（透明圆出现），再从中心放大抹掉遮罩。
+                withAnimation(.easeInOut(duration: 0.55).delay(0.2)) { revealed = true }
+            }
+
+            // 阶段即标签：网格里不需要再读应用名，图标本身已经说明是哪个应用。
+            Text(download.phase.label)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(.white)
+                .lineLimit(2)
+                .multilineTextAlignment(.center)
+                .frame(height: 32, alignment: .top)
+                .shadow(color: .black.opacity(0.8), radius: 2, y: 1)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 6)
+    }
+
+    private var artwork: some View {
+        Group {
+            if let image = download.icon {
+                Image(nsImage: image)
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
+            } else {
+                // Artwork is fetched asynchronously; a neutral tile keeps the
+                // grid stable instead of flashing a wrong icon.
+                ZStack {
+                    RoundedRectangle(cornerRadius: iconSize * 0.24, style: .continuous)
+                        .fill(.white.opacity(0.14))
+                    VStack(spacing: iconSize * 0.05) {
+                        Image(systemName: "arrow.down")
+                            .font(.system(size: iconSize * 0.26, weight: .regular))
+                        Text(download.phase.label)
+                            .font(.system(size: max(10, iconSize * 0.11), weight: .medium))
+                    }
+                    .foregroundStyle(.white.opacity(0.9))
+                }
+            }
+        }
+        .frame(width: iconSize, height: iconSize)
+        .shadow(color: .black.opacity(0.28), radius: 7, y: 5)
+    }
+}
+
+/// 遮罩的“可见区域”：整块矩形挖掉 12 点起顺时针的进度扇形。
+/// `clockwise: false` 在 SwiftUI 翻转坐标系里正是视觉顺时针（点包含测试验证）。
+private struct WedgeMask: Shape {
+    /// 扇形直径占图标内切圆的比例；RevealMask 的起始圆与此一致。
+    static let pieScale: CGFloat = 0.72
+    var fraction: Double
+
+    var animatableData: Double {
+        get { fraction }
+        set { fraction = newValue }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path(rect)
+        let clamped = min(max(fraction, 0), 1)
+        guard clamped > 0 else { return path }
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        path.move(to: center)
+        path.addArc(
+            center: center,
+            radius: min(rect.width, rect.height) / 2 * WedgeMask.pieScale,
+            startAngle: .degrees(-90),
+            endAngle: .degrees(-90 + 360 * clamped),
+            clockwise: false
+        )
+        path.closeSubpath()
+        return path
+    }
+}
+
+/// 完成揭示：遮罩上再挖一个圆，半径从进度圆大小放大到覆盖整个图标
+/// （对角线的一半），把剩余阴影从中心抹掉。
+private struct RevealMask: Shape {
+    var progress: CGFloat
+
+    var animatableData: CGFloat {
+        get { progress }
+        set { progress = newValue }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path(rect)
+        guard progress > 0 else { return path }
+        let base = min(rect.width, rect.height) / 2 * WedgeMask.pieScale
+        let cover = sqrt(rect.width * rect.width + rect.height * rect.height) / 2
+        let radius = base + (cover - base) * min(max(progress, 0), 1)
+        path.addEllipse(in: CGRect(
+            x: rect.midX - radius,
+            y: rect.midY - radius,
+            width: radius * 2,
+            height: radius * 2
+        ))
+        return path
     }
 }
 

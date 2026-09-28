@@ -154,6 +154,7 @@ final class LauncherController: ObservableObject {
         store.scanApplications()
         store.startObservingApplicationChanges()
         store.startObservingSystemLaunches()
+        store.startObservingAppStoreDownloads()
         preWarmWallpaperCache()
         rebuildPanels()
         setupAnimator()
@@ -170,6 +171,7 @@ final class LauncherController: ObservableObject {
     func terminateImmediately() {
         diagnosticRecord("lifecycle", "controller-terminate presented=\(isPresented) panels=\(panels.count)")
         store.stopObservingApplicationChanges()
+        store.stopObservingAppStoreDownloads()
         animator.stop()
         _isPresentedOnScreen.set(false)
         isPresented = false

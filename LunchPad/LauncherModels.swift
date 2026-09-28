@@ -98,6 +98,10 @@ final class LauncherStore: ObservableObject {
     @Published var uninstallRequest: UninstallRequest?
     @Published var errorMessage: String?
     @Published var selectedEntryID: String?
+    /// App Store downloads in flight, mirrored from `AppStoreDownloadMonitor`.
+    /// Display-only: these never enter `entries` and are never persisted.
+    @Published private(set) var downloads: [AppStoreDownload] = []
+    private var downloadMonitor: AppStoreDownloadMonitor?
     @Published var draggedEntryID: String?
     @Published var dragTargetID: String?
     @Published var folderCandidateID: String?
@@ -258,11 +262,15 @@ final class LauncherStore: ObservableObject {
 
     func scanApplications() {
         isScanning = true
+        incompleteRetryWorkItem?.cancel()
+        incompleteRetryWorkItem = nil
         Task {
+            let admitted = forceAdmittedIncompletePaths
             let discovered = await Task.detached(priority: .userInitiated) {
-                Self.discoverApplications()
+                Self.discoverApplications(admitting: admitted)
             }.value
-            merge(discovered)
+            merge(discovered.applications, preserving: Set(discovered.incompletePaths))
+            recordIncompleteBundles(discovered.incompletePaths)
             isScanning = false
         }
     }
@@ -312,6 +320,30 @@ final class LauncherStore: ObservableObject {
         appRootSources.removeAll()
         rescanWorkItem?.cancel()
         rescanWorkItem = nil
+        incompleteRetryWorkItem?.cancel()
+        incompleteRetryWorkItem = nil
+        incompletePollWorkItem?.cancel()
+        incompletePollWorkItem = nil
+    }
+
+    // MARK: - App Store download tiles
+
+    /// Starts watching the App Store's own state for downloads in flight.
+    /// Purely event driven — idle cost is a handful of file descriptors.
+    func startObservingAppStoreDownloads() {
+        guard downloadMonitor == nil else { return }
+        let monitor = AppStoreDownloadMonitor()
+        monitor.onSnapshot = { [weak self] snapshot in
+            self?.downloads = snapshot
+        }
+        downloadMonitor = monitor
+        monitor.start()
+    }
+
+    func stopObservingAppStoreDownloads() {
+        downloadMonitor?.stop()
+        downloadMonitor = nil
+        if !downloads.isEmpty { downloads = [] }
     }
 
     /// Coalesce a burst of directory events (a copy writes many times) into a
@@ -325,6 +357,105 @@ final class LauncherStore: ObservableObject {
         }
         rescanWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+    }
+
+    // MARK: - Bundles that are still being copied into place
+
+    /// Full scans already spent on a bundle that never finished copying.
+    private var incompleteScanAttempts: [String: Int] = [:]
+    /// Bundles whose scan retries ran out; they are checked directly instead.
+    private var settledIncompletePaths: Set<String> = []
+    /// Paths kept visible although they never became ready — admitting them
+    /// beats hiding the app forever.
+    private var forceAdmittedIncompletePaths: Set<String> = []
+    private var incompletePollCounts: [String: Int] = [:]
+    private var incompleteRetryWorkItem: DispatchWorkItem?
+    private var incompletePollWorkItem: DispatchWorkItem?
+    /// Delay before each follow-up scan while a bundle is still copying:
+    /// tight at first — most installs finish within seconds — then backing
+    /// off, before the cheap per-path poll takes over.
+    nonisolated private static let incompleteRetrySchedule: [Double] = [1.5, 1.5, 2, 3, 5, 8, 10, 10]
+    nonisolated private static let incompletePollInterval: TimeInterval = 10
+    nonisolated private static let maxIncompletePolls = 60
+
+    /// A new .app only produces one directory event — the folder appearing —
+    /// and that lands while the copy is still running, so the finished bundle
+    /// needs follow-up scans to show up at all.
+    private func recordIncompleteBundles(_ paths: [String]) {
+        let incomplete = Set(paths)
+        let retryable = incomplete.subtracting(forceAdmittedIncompletePaths)
+        forceAdmittedIncompletePaths.formIntersection(incomplete)
+        incompleteScanAttempts = incompleteScanAttempts.filter { retryable.contains($0.key) }
+        incompletePollCounts = incompletePollCounts.filter { retryable.contains($0.key) }
+        settledIncompletePaths.formIntersection(retryable)
+
+        var needsRetry = false
+        for path in retryable where !settledIncompletePaths.contains(path) {
+            let attempts = (incompleteScanAttempts[path] ?? 0) + 1
+            if attempts >= Self.incompleteRetrySchedule.count {
+                incompleteScanAttempts.removeValue(forKey: path)
+                settledIncompletePaths.insert(path)
+                incompletePollCounts[path] = 0
+            } else {
+                incompleteScanAttempts[path] = attempts
+                needsRetry = true
+            }
+        }
+
+        incompleteRetryWorkItem?.cancel()
+        incompleteRetryWorkItem = nil
+        if needsRetry { scheduleIncompleteScanRetry() }
+        incompletePollWorkItem?.cancel()
+        incompletePollWorkItem = nil
+        if !settledIncompletePaths.isEmpty { scheduleIncompleteBundlePoll() }
+    }
+
+    /// The path closest to its first sighting sets the pace, so a newly seen
+    /// bundle never waits out an older one's backoff.
+    private func scheduleIncompleteScanRetry() {
+        let attempts = incompleteScanAttempts.values.min() ?? 1
+        let schedule = Self.incompleteRetrySchedule
+        let delay = schedule[min(max(attempts - 1, 0), schedule.count - 1)]
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in self?.scanApplications() }
+        }
+        incompleteRetryWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func scheduleIncompleteBundlePoll() {
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in self?.pollIncompleteBundles() }
+        }
+        incompletePollWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.incompletePollInterval, execute: work)
+    }
+
+    /// Cheap per-path check for bundles that ran out of full-scan retries; a
+    /// full rescan runs only once one of them actually finished copying.
+    private func pollIncompleteBundles() {
+        incompletePollWorkItem = nil
+        guard !settledIncompletePaths.isEmpty else { return }
+        let ready = settledIncompletePaths.filter { Self.bundleIsReady(at: URL(fileURLWithPath: $0)) }
+        if !ready.isEmpty {
+            scanApplications()
+            return
+        }
+        var exhausted: [String] = []
+        for path in settledIncompletePaths {
+            let polls = (incompletePollCounts[path] ?? 0) + 1
+            if polls >= Self.maxIncompletePolls { exhausted.append(path) }
+            else { incompletePollCounts[path] = polls }
+        }
+        if !exhausted.isEmpty {
+            // Never finished: show it as it is rather than hiding it forever.
+            forceAdmittedIncompletePaths.formUnion(exhausted)
+            settledIncompletePaths.subtract(exhausted)
+            exhausted.forEach { incompletePollCounts.removeValue(forKey: $0) }
+            scanApplications()
+            return
+        }
+        scheduleIncompleteBundlePoll()
     }
 
     func application(in entry: LauncherEntry) -> LauncherApplication? {
@@ -572,7 +703,52 @@ final class LauncherStore: ObservableObject {
         guard query.isEmpty else {
             return filteredApplications.map { .application($0) }
         }
-        return displayEntries
+        return gridEntries
+    }
+
+    /// The grid's real content plus one tile per in-flight App Store download.
+    /// Downloads live only here — never in `entries`, so sorting, drags,
+    /// persistence, and keyboard navigation keep operating on real apps alone
+    /// and a download can never be reordered or saved by mistake.
+    ///
+    /// A download replaces the tile of the app it is updating (same bundle id)
+    /// so an update never shows two tiles for one app; downloads with no
+    /// installed app yet are appended after everything else.
+    var gridEntries: [LauncherEntry] {
+        let base = displayEntries
+        guard !downloads.isEmpty else { return base }
+        var shown = Set<Int64>()
+        var result: [LauncherEntry] = []
+        result.reserveCapacity(base.count + downloads.count)
+        for entry in base {
+            if case .application(let application) = entry,
+               let bundleIdentifier = application.bundleIdentifier,
+               let download = downloads.first(where: { $0.bundleIdentifier == bundleIdentifier }) {
+                shown.insert(download.id)
+                result.append(downloadEntry(for: download))
+            } else {
+                result.append(entry)
+            }
+        }
+        for download in downloads where !shown.contains(download.id) {
+            result.append(downloadEntry(for: download))
+        }
+        return result
+    }
+
+    private func downloadEntry(for download: AppStoreDownload) -> LauncherEntry {
+        .application(LauncherApplication(
+            name: download.name,
+            path: download.entryID,
+            bundleIdentifier: download.bundleIdentifier,
+            isProtected: false
+        ))
+    }
+
+    /// The download behind a display-only entry, if `entry` is one.
+    func download(for entry: LauncherEntry) -> AppStoreDownload? {
+        guard case .application(let application) = entry else { return nil }
+        return downloads.first { $0.entryID == application.path }
     }
 
     /// Memoized `.app` bundle creation dates. Creation dates are stable, so the
@@ -1824,7 +2000,6 @@ final class LauncherStore: ObservableObject {
         Task.detached(priority: .userInitiated) {
             let fileManager = FileManager.default
             var failures: [String] = []
-            var permissionDeniedTargets: [URL] = []
             if !runningProcessIDs.isEmpty {
                 for _ in 0..<40 {
                     guard runningProcessIDs.contains(where: Self.processIsAlive) else { break }
@@ -1838,26 +2013,40 @@ final class LauncherStore: ObservableObject {
                     try? await Task.sleep(for: .milliseconds(50))
                 }
             }
-            for target in targets {
-                guard fileManager.fileExists(atPath: target.path) else { continue }
-                do {
-                    try fileManager.removeItem(at: target)
-                } catch {
-                    if Self.isPermissionDenied(error) {
-                        permissionDeniedTargets.append(target)
-                    } else {
-                        failures.append("\(target.lastPathComponent)：\(error.localizedDescription)")
-                    }
+            for target in targets where fileManager.fileExists(atPath: target.path) {
+                try? fileManager.removeItem(at: target)
+            }
+            // Sandbox-container paths are blocked by macOS for every process
+            // without Full Disk Access — an admin-password `rm` is denied there
+            // too, so they are excluded from the password prompt and reported
+            // with guidance instead.
+            let needsDiskAccess = !Self.hasFullDiskAccess()
+            let remaining = targets.filter { fileManager.fileExists(atPath: $0.path) }
+            var protectedRemaining: [URL] = []
+            var adminTargets: [URL] = []
+            for target in remaining {
+                if needsDiskAccess && Self.isSystemProtectedPath(target) {
+                    protectedRemaining.append(target)
+                } else {
+                    adminTargets.append(target)
                 }
             }
-            if !permissionDeniedTargets.isEmpty {
-                if let authorizationError = Self.removeWithAdministratorPrivileges(permissionDeniedTargets) {
-                    failures.append(authorizationError)
+            var authorizationFailed = false
+            if !adminTargets.isEmpty, let authorizationError = Self.removeWithAdministratorPrivileges(adminTargets) {
+                authorizationFailed = true
+                failures.append(authorizationError)
+            }
+            for target in targets where fileManager.fileExists(atPath: target.path) {
+                if protectedRemaining.contains(target) {
+                    failures.append("\(target.lastPathComponent)：受系统保护，需要“完全磁盘访问”权限")
+                } else if adminTargets.contains(target) {
+                    failures.append("\(target.lastPathComponent)：\(authorizationFailed ? "授权未完成，未删除" : "管理员授权后仍无法删除")")
                 } else {
-                    for target in permissionDeniedTargets where fileManager.fileExists(atPath: target.path) {
-                        failures.append("\(target.lastPathComponent)：管理员授权后仍无法删除")
-                    }
+                    failures.append("\(target.lastPathComponent)：无法删除")
                 }
+            }
+            if !protectedRemaining.isEmpty {
+                failures.append("沙盒容器需在「系统设置 → 隐私与安全性 → 完全磁盘访问」中允许 LunchPad 后重试")
             }
             let applicationWasDeleted = !fileManager.fileExists(atPath: applicationURL.path)
             let failureSnapshot = failures
@@ -1877,44 +2066,70 @@ final class LauncherStore: ObservableObject {
         Darwin.kill(processID, 0) == 0 || errno == EPERM
     }
 
-    nonisolated private static func isPermissionDenied(_ error: Error) -> Bool {
-        let nsError = error as NSError
-        if nsError.domain == NSCocoaErrorDomain,
-           [NSFileReadNoPermissionError, NSFileWriteNoPermissionError].contains(nsError.code) {
-            return true
-        }
-        if nsError.domain == NSPOSIXErrorDomain,
-           [Int(EACCES), Int(EPERM)].contains(nsError.code) {
-            return true
-        }
-        if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? Error {
-            return isPermissionDenied(underlying)
-        }
-        return false
+    /// Probe: creating a file under `~/Library/Containers` is denied unless the
+    /// responsible process has Full Disk Access — even root's `rm` is refused,
+    /// so this doubles as the "would a password prompt help?" check.
+    nonisolated static func hasFullDiskAccess() -> Bool {
+        let fileManager = FileManager.default
+        let probe = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Containers/.lunchpad-fda-probe-\(UUID().uuidString)")
+        guard fileManager.createFile(atPath: probe.path, contents: Data()) else { return false }
+        try? fileManager.removeItem(at: probe)
+        return true
     }
 
+    nonisolated static func isSystemProtectedPath(_ url: URL) -> Bool {
+        let path = url.standardizedFileURL.path
+        let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
+        return path.hasPrefix(home + "/Library/Containers/")
+            || path.hasPrefix(home + "/Library/Application Scripts/")
+    }
+
+    /// `chflags` + `rm -rf` through an admin-authorization `osascript`
+    /// subprocess (NSAppleScript is not usable off the main thread). The inner
+    /// shell always exits 0 so one undeletable path never aborts the batch —
+    /// callers re-check every path afterwards and report what is left.
     nonisolated private static func removeWithAdministratorPrivileges(_ urls: [URL]) -> String? {
-        let arguments = urls.map { shellQuoted($0.standardizedFileURL.path) }.joined(separator: " ")
-        let command = "/bin/rm -rf -- \(arguments)"
-        let encodedCommand = Data(command.utf8).base64EncodedString()
+        var script = ""
+        for url in urls {
+            let quoted = shellQuoted(url.standardizedFileURL.path)
+            // Root cannot unlink uchg/schg files either; flags must be cleared first.
+            script += "/bin/chflags -R 0 \(quoted) 2>/dev/null\n"
+            script += "/bin/rm -rf -- \(quoted) 2>/dev/null\n"
+        }
+        script += "exit 0\n"
+        let encodedCommand = Data(script.utf8).base64EncodedString()
         let privilegedCommand = "/bin/echo '\(encodedCommand)' | /usr/bin/base64 -D | /bin/sh"
         let escapedCommand = privilegedCommand
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
-        guard let script = NSAppleScript(
-            source: "do shell script \"\(escapedCommand)\" with administrator privileges"
-        ) else {
-            return "无法创建管理员授权请求"
+        let source = """
+        with timeout of 600 seconds
+        do shell script "\(escapedCommand)" with administrator privileges
+        end timeout
+        """
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", source]
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+        do {
+            try process.run()
+        } catch {
+            return "无法启动管理员授权：\(error.localizedDescription)"
         }
-        var errorInfo: NSDictionary?
-        script.executeAndReturnError(&errorInfo)
-        guard let errorInfo else { return nil }
-        let code = errorInfo[NSAppleScript.errorNumber] as? Int
-        if code == -128 {
-            return "已取消管理员授权，未删除需要授权的项目"
+        process.waitUntilExit()
+        let errorText = (String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard process.terminationStatus == 0 else {
+            if errorText.contains("-128") || errorText.localizedCaseInsensitiveContains("cancel") {
+                return "已取消管理员授权，需要授权的项目未删除"
+            }
+            return "管理员授权删除失败：\(errorText.isEmpty ? "未知错误" : errorText)"
         }
-        let message = errorInfo[NSAppleScript.errorMessage] as? String ?? "未知错误"
-        return "管理员授权删除失败：\(message)"
+        return nil
     }
 
     nonisolated private static func shellQuoted(_ value: String) -> String {
@@ -1958,7 +2173,10 @@ final class LauncherStore: ObservableObject {
         if let openFolderID, folder(id: openFolderID) == nil { self.openFolderID = nil }
     }
 
-    private func merge(_ discovered: [LauncherApplication]) {
+    /// `preservedPaths` are bundles that are still being copied: their tile
+    /// keeps the last good entry instead of vanishing mid-update, while a
+    /// bundle that is merely gone is dropped as before.
+    private func merge(_ discovered: [LauncherApplication], preserving preservedPaths: Set<String>) {
         let visible = discovered.filter { !hiddenPaths.contains($0.path) }
         let byPath = Dictionary(uniqueKeysWithValues: visible.map { ($0.path, $0) })
         var represented = Set<String>()
@@ -1967,12 +2185,17 @@ final class LauncherStore: ObservableObject {
         entries = persisted.compactMap { entry in
             switch entry {
             case .application(let old):
-                guard let fresh = byPath[old.path] else { return nil }
+                guard let fresh = byPath[old.path] else {
+                    // Still copying: keep the entry we already have.
+                    return preservedPaths.contains(old.path) ? .application(old) : nil
+                }
                 represented.insert(fresh.path)
                 return .application(fresh)
             case .folder(var folder):
                 folder.applications = folder.applications.compactMap { old in
-                    guard let fresh = byPath[old.path] else { return nil }
+                    guard let fresh = byPath[old.path] else {
+                        return preservedPaths.contains(old.path) ? old : nil
+                    }
                     represented.insert(fresh.path)
                     return fresh
                 }
@@ -2098,12 +2321,79 @@ final class LauncherStore: ObservableObject {
         return "文件夹"
     }
 
-    nonisolated private static func discoverApplications() -> [LauncherApplication] {
+    /// Result of one pass over the application folders.
+    nonisolated private struct DiscoveryResult: Sendable {
+        var applications: [LauncherApplication]
+        /// Paths whose bundle is still being written — skipped unless admitted.
+        var incompletePaths: [String]
+    }
+
+    /// True once the bundle carries everything an icon lookup needs.
+    ///
+    /// A .app folder shows up in the application folder the moment the copy
+    /// starts, well before its contents land. Answering for it is expensive:
+    /// `NSWorkspace.icon(forFile:)` replies with the generic app icon and
+    /// keeps that answer for the path, and `Bundle(url:)` latches the
+    /// half-read Info.plist for the rest of the process — both only clear
+    /// after a restart, which is what made a fresh install keep showing the
+    /// unusable placeholder icon.
+    nonisolated private static func bundleIsReady(at url: URL) -> Bool {
+        let fileManager = FileManager.default
+        let contents = url.appendingPathComponent("Contents", isDirectory: true)
+        let standardPlist = contents.appendingPathComponent("Info.plist")
+        let rootPlist = url.appendingPathComponent("Info.plist")
+        let plistURL = fileManager.fileExists(atPath: standardPlist.path)
+            ? standardPlist
+            : (fileManager.fileExists(atPath: rootPlist.path) ? rootPlist : nil)
+
+        guard let plistURL else {
+            // Either the copy has not created Contents yet (Finder makes it
+            // right after the .app folder) or the bundle follows a wrapper
+            // layout whose Info.plist lives deeper in — those resolve through
+            // Foundation the way they always have, so let them through.
+            return !fileManager.fileExists(atPath: contents.path)
+        }
+        guard let data = try? Data(contentsOf: plistURL),
+              let plist = try? PropertyListSerialization.propertyList(from: data, format: nil),
+              let info = plist as? [String: Any]
+        else {
+            // Present but not parseable yet: still being written.
+            return false
+        }
+
+        var declaredIcons: [String] = []
+        if let file = info["CFBundleIconFile"] as? String, !file.isEmpty { declaredIcons.append(file) }
+        if let files = info["CFBundleIconFiles"] as? [String] { declaredIcons.append(contentsOf: files.filter { !$0.isEmpty }) }
+        if let name = info["CFBundleIconName"] as? String, !name.isEmpty { declaredIcons.append(name) }
+        guard !declaredIcons.isEmpty else { return true }
+        // Only an asset-catalog declaration can be satisfied by a .car.
+        let usesAssetCatalog = !((info["CFBundleIconName"] as? String) ?? "").isEmpty
+
+        // macOS keeps icons next to the plist's Resources folder, iOS-style
+        // bundles keep PNGs next to a root-level plist.
+        let bundleRoot = plistURL.deletingLastPathComponent()
+        for directory in [bundleRoot, bundleRoot.appendingPathComponent("Resources", isDirectory: true)] {
+            guard let entries = try? fileManager.contentsOfDirectory(atPath: directory.path) else { continue }
+            if usesAssetCatalog, entries.contains(where: { $0.lowercased().hasSuffix(".car") }) { return true }
+            for declared in declaredIcons {
+                let stem = (declared as NSString).deletingPathExtension
+                let prefix = stem.isEmpty ? declared : stem
+                // `@2x`/`@3x` variants mean the declared name is only a stem.
+                if entries.contains(where: { entry in
+                    entry == declared || entry.hasPrefix(prefix + ".") || entry.hasPrefix(prefix + "@")
+                }) { return true }
+            }
+        }
+        return false
+    }
+
+    nonisolated private static func discoverApplications(admitting admittedPaths: Set<String>) -> DiscoveryResult {
         let fileManager = FileManager.default
         var roots = ["/Applications", "/System/Applications"]
         let userApplications = fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Applications").path
         if fileManager.fileExists(atPath: userApplications) { roots.append(userApplications) }
         var results: [String: LauncherApplication] = [:]
+        var incompletePaths: [String] = []
 
         for root in roots {
             guard let enumerator = fileManager.enumerator(
@@ -2115,12 +2405,17 @@ final class LauncherStore: ObservableObject {
             for case let url as URL in enumerator {
                 guard url.pathExtension.caseInsensitiveCompare("app") == .orderedSame else { continue }
                 enumerator.skipDescendants()
+                let standardizedPath = url.resolvingSymlinksInPath().standardizedFileURL.path
+                let ready = bundleIsReady(at: url)
+                if !ready {
+                    incompletePaths.append(standardizedPath)
+                    guard admittedPaths.contains(standardizedPath) else { continue }
+                }
                 guard let bundle = Bundle(url: url) else { continue }
                 // 仅跳过后台代理应用（LSBackgroundOnly），它们没有 UI。
                 // LSUIElement 应用（菜单栏应用等）保留显示——macOS 启动台同样展示。
                 let lsBackgroundOnly = (bundle.object(forInfoDictionaryKey: "LSBackgroundOnly") as? NSNumber)?.boolValue ?? false
                 if lsBackgroundOnly { continue }
-                let standardizedPath = url.resolvingSymlinksInPath().standardizedFileURL.path
                 let displayName = (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
                     ?? (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String)
                     ?? url.deletingPathExtension().lastPathComponent
@@ -2134,7 +2429,10 @@ final class LauncherStore: ObservableObject {
             }
         }
 
-        return results.values.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        return DiscoveryResult(
+            applications: results.values.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending },
+            incompletePaths: incompletePaths
+        )
     }
 }
 
