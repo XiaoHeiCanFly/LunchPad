@@ -5,8 +5,9 @@ import Foundation
 /// The log is deliberately file based (instead of only using unified logging)
 /// so a user can collect it after the launcher was invoked but never became
 /// visible. Writes are serialized and the file is rotated before it grows
-/// beyond 2 MB.
-final class LauncherDiagnostics: @unchecked Sendable {
+/// beyond 2 MB. Nonisolated: the raw-trackpad callback writes to it directly
+/// from its own thread; the lock makes that safe.
+nonisolated final class LauncherDiagnostics: @unchecked Sendable {
     static let shared = LauncherDiagnostics()
 
     let directoryURL: URL

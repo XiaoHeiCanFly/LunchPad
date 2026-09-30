@@ -273,7 +273,8 @@ struct GestureRegressionTests {
             try near(contact.snapshot(for: generation, at: 106.08)!.motion, 0.05,
                      "Motion after rebasing")
             contact.endContact(contactCount: changedCount, at: 107)
-            try require(!contact.snapshot(for: generation, at: 107.08)!.contactActive,
+            try require(!contact.snapshot(for: generation,
+                                          at: 107 + TrackpadContactState.contactLossGrace + 0.01)!.contactActive,
                         "Sustained \(changedCount)-finger loss must finish after grace")
         }
     }
@@ -373,6 +374,63 @@ struct GestureRegressionTests {
         }
     }
 
+    static func contactClusteringCollapsesSplitFingers() throws {
+        // One rolling finger reported twice among four distinct fingers.
+        let splitHand = [
+            CGPoint(x: 0.30, y: 0.50),
+            CGPoint(x: 0.31, y: 0.51),
+            CGPoint(x: 0.45, y: 0.50),
+            CGPoint(x: 0.60, y: 0.50),
+            CGPoint(x: 0.75, y: 0.50)
+        ]
+        try require(TrackpadContactClustering.centers(of: splitHand).count == 4,
+                    "A split finger must collapse into one contact")
+        // Three fingers where one is split must still count as three.
+        let threeWithSplit = [
+            CGPoint(x: 0.30, y: 0.50),
+            CGPoint(x: 0.31, y: 0.51),
+            CGPoint(x: 0.55, y: 0.50),
+            CGPoint(x: 0.80, y: 0.50)
+        ]
+        try require(TrackpadContactClustering.centers(of: threeWithSplit).count == 3,
+                    "Three fingers with a split must not count as four")
+        let fourDistinct = [
+            CGPoint(x: 0.30, y: 0.50),
+            CGPoint(x: 0.45, y: 0.50),
+            CGPoint(x: 0.60, y: 0.50),
+            CGPoint(x: 0.75, y: 0.50)
+        ]
+        try require(TrackpadContactClustering.centers(of: fourDistinct).count == 4,
+                    "Distinct fingertips must never merge")
+    }
+
+    static func stableBeginRejectsTransientFourFrames() throws {
+        let contact = TrackpadContactState()
+        // A single stray four-count frame must not begin a gesture.
+        try require(contact.noteQualifiedFrame(radius: 0.2, at: 100) == nil,
+                    "One stray frame began a contact")
+        try require(contact.snapshot(at: 100.5) == nil,
+                    "Stray frame produced a generation")
+        // Any non-qualifying frame disarms the candidate completely.
+        contact.endContact(contactCount: 3, at: 100.01)
+        contact.noteQualifiedFrame(radius: 0.2, at: 101.0)
+        try require(contact.noteQualifiedFrame(radius: 0.2, at: 101.01) == nil
+                        && contact.noteQualifiedFrame(radius: 0.2, at: 101.02) == nil,
+                    "Candidate began before the stability window elapsed")
+        let generation = contact.noteQualifiedFrame(radius: 0.2, at: 101.04)
+        try require(generation != nil, "Sustained four-contact frames must begin")
+        // A long gap between qualified frames restarts the window.
+        let restarted = TrackpadContactState()
+        restarted.noteQualifiedFrame(radius: 0.2, at: 200.0)
+        restarted.noteQualifiedFrame(radius: 0.2, at: 200.02)
+        try require(restarted.noteQualifiedFrame(radius: 0.2, at: 200.2) == nil,
+                    "A stale candidate survived a frame gap")
+        try require(restarted.noteQualifiedFrame(radius: 0.2, at: 200.22) == nil,
+                    "Restarted candidate must re-earn its stability window")
+        try require(restarted.noteQualifiedFrame(radius: 0.2, at: 200.24) != nil,
+                    "Fresh sustained frames must begin after restart")
+    }
+
     static func main() {
         let tests: [(String, () throws -> Void)] = [
             ("slow drags and stationary holds remain under finger control", slowHeldGestures),
@@ -389,7 +447,9 @@ struct GestureRegressionTests {
             ("generations retain frozen terminal samples", generationsKeepFrozenTerminalSamples),
             ("lifecycle cancellation invalidates queued begins and allows recovery", lifecycleCancellationInvalidatesQueuedBegins),
             ("raw contact and animator preserve a between-frame release", contactAndAnimatorRetainBetweenFrameMotion),
-            ("presentation cancellation cannot revive an old frame or release", presentationCancellationCannotReviveTracking)
+            ("presentation cancellation cannot revive an old frame or release", presentationCancellationCannotReviveTracking),
+            ("split fingers cluster to a stable contact count", contactClusteringCollapsesSplitFingers),
+            ("transient four-count frames never begin a gesture", stableBeginRejectsTransientFourFrames)
         ]
         var failures = 0
         for (name, test) in tests {

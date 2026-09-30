@@ -779,10 +779,27 @@ final class LauncherController: ObservableObject {
                     }
                     return Unmanaged.passUnretained(event)
                 }
-                // Block system gesture events when presented or during a pinch.
+                // Forensic line for the system-gesture audit: which begin/end
+                // events arrive and what state they saw (rate-limited in the
+                // sink). Logged before any decision so `pending` still shows
+                // the pre-decision value for begins.
+                if type.rawValue == 19 || type.rawValue == 20 {
+                    GestureTouchDiagnostics.shared.noteSystemGesture(
+                        type.rawValue == 19 ? "begin" : "end",
+                        "pending=\(RawTrackpadGestureMonitor.pendingBeginGesture ? 1 : 0)"
+                            + " contact=\(RawTrackpadGestureMonitor.hasFourFingerContact ? 1 : 0)"
+                            + " suppress=\(RawTrackpadGestureMonitor.isSystemGestureSuppressed ? 1 : 0)"
+                            + " presented=\(c.isPresentedOnScreen ? 1 : 0)"
+                    )
+                }
+                // Block system gesture events when presented, during a pinch,
+                // or while a recent four-finger attempt still owns the pad —
+                // a failed pinch must not fall through to the system's own
+                // action for the same contact.
                 if [18, 19, 20, 29, 30, 31].contains(type.rawValue) {
                     if c.isPresentedOnScreen { return nil }
                     if RawTrackpadGestureMonitor.hasFourFingerContact { return nil }
+                    if RawTrackpadGestureMonitor.isSystemGestureSuppressed { return nil }
                 }
                 // 拖拽期间把指针拉回启动台所在显示器：图标无法被拖到其他显示器。
                 // 拖拽时鼠标移动以 leftMouseDragged 形式上报，因此一并处理。
