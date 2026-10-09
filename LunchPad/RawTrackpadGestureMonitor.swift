@@ -94,19 +94,64 @@ nonisolated final class GestureTouchDiagnostics: @unchecked Sendable {
     private var clusterHistogram: [Int: Int] = [:]
     private var lastCoordLogAt: TimeInterval = 0
     private var lastTapLogAt: TimeInterval = 0
+    // Calibration context for palm-vs-finger discrimination (see armLag/paird).
+    private var episodeStart: TimeInterval?
+    private var lastContactAt: TimeInterval?
+    private var armLag: TimeInterval?
+    private var initialPairs: [CGFloat] = []
+    private var latestCenters: [CGPoint] = []
+    private var rawDumpBudget = 3
 
     /// Records one processed frame. Counters only arm once a qualifying
     /// (four-cluster) frame appears, so ordinary one-finger use never accumulates.
-    func noteFrame(raw: Int, clusters: Int, qualified: Bool) {
+    /// Returns true on the arming frame itself (the caller then dumps raw
+    /// contact records while the budget lasts).
+    @discardableResult
+    func noteFrame(raw: Int, clusters: Int, qualified: Bool, centers: [CGPoint]) -> Bool {
         lock.lock(); defer { lock.unlock() }
+        let now = ProcessInfo.processInfo.systemUptime
         if armedSince == nil {
-            guard qualified else { return }
-            armedSince = ProcessInfo.processInfo.systemUptime
+            // Track the touch episode while cold: armLag measures how long
+            // contacts were already present before the four-count arrived
+            // (palm-first patterns arm with a large lag).
+            if clusters > 0 {
+                if let last = lastContactAt, now - last <= 0.1 {
+                    // Continuation of the current touch episode.
+                } else {
+                    episodeStart = now
+                }
+                lastContactAt = now
+            }
+            guard qualified else { return false }
+            armedSince = now
+            armLag = episodeStart.map { now - $0 } ?? -1
+            initialPairs = Self.sortedPairDistances(centers)
+            latestCenters = centers
+            frames += 1
+            qualifiedFrames += 1
+            rawHistogram[raw, default: 0] += 1
+            clusterHistogram[clusters, default: 0] += 1
+            return true
         }
         frames += 1
         if qualified { qualifiedFrames += 1 }
         rawHistogram[raw, default: 0] += 1
         clusterHistogram[clusters, default: 0] += 1
+        if centers.count == 4 { latestCenters = centers }
+        return false
+    }
+
+    /// One full 96-byte contact record per contact, straight after arming —
+    /// used once to locate a size/area field in the private layout.
+    func noteRawDump(records: [[Float]]) {
+        lock.lock(); defer { lock.unlock() }
+        guard rawDumpBudget > 0, !records.isEmpty else { return }
+        rawDumpBudget -= 1
+        let body = records.enumerated().map { index, floats in
+            let values = floats.map { String(format: "%.4f", $0) }.joined(separator: ",")
+            return "c\(index)=[\(values)]"
+        }.joined(separator: " ")
+        LauncherDiagnostics.shared.record("gesture-touch", "raw-record n=\(records.count) \(body)")
     }
 
     func noteOtherDeviceDrop() {
@@ -119,7 +164,7 @@ nonisolated final class GestureTouchDiagnostics: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard let since = armedSince else { return }
         let now = ProcessInfo.processInfo.systemUptime
-        let line = "end=\(event.outcome.rawValue)"
+        var line = "end=\(event.outcome.rawValue)"
             + " gen=\(event.generation)"
             + " dur=\(fixed(now - since))"
             + " motion=\(fixed(event.motion))"
@@ -127,13 +172,42 @@ nonisolated final class GestureTouchDiagnostics: @unchecked Sendable {
             + " raw=\(histogramText(rawHistogram))"
             + " clusters=\(histogramText(clusterHistogram))"
             + " other-drops=\(otherDeviceDrops)"
+        line += String(format: " armLag=%.3f", armLag ?? -1)
+        if initialPairs.count == 6, latestCenters.count == 4 {
+            let latest = Self.sortedPairDistances(latestCenters)
+            if latest.count == 6 {
+                let deltas = zip(latest, initialPairs)
+                    .map { String(format: "%.3f", $0 - $1) }
+                    .joined(separator: ",")
+                line += " paird={\(deltas)}"
+            }
+        }
         armedSince = nil
         frames = 0
         qualifiedFrames = 0
         otherDeviceDrops = 0
         rawHistogram = [:]
         clusterHistogram = [:]
+        armLag = nil
+        initialPairs = []
+        latestCenters = []
         LauncherDiagnostics.shared.record("gesture-touch", line)
+    }
+
+    /// Sorted pairwise distances of a four-contact set: the first three are
+    /// the intra-group gaps, the last three the spread-out pairs.
+    private static func sortedPairDistances(_ centers: [CGPoint]) -> [CGFloat] {
+        guard centers.count == 4 else { return [] }
+        var distances: [CGFloat] = []
+        for index in 0..<4 {
+            for other in (index + 1)..<4 {
+                distances.append(hypot(
+                    centers[index].x - centers[other].x,
+                    centers[index].y - centers[other].y
+                ))
+            }
+        }
+        return distances.sorted()
     }
 
     /// Rate-limited: a broken contact layout would otherwise log every frame.
@@ -191,7 +265,9 @@ nonisolated private func lunchPadTrackpadContactCallback(
 
     let rawCount = Int(contactCount)
     guard let contacts, rawCount > 0 else {
-        GestureTouchDiagnostics.shared.noteFrame(raw: rawCount, clusters: 0, qualified: false)
+        GestureTouchDiagnostics.shared.noteFrame(
+            raw: rawCount, clusters: 0, qualified: false, centers: []
+        )
         TrackpadContactState.shared.endContact(contactCount: 0, at: now)
         ContactDeviceOwnership.shared.releaseIfIdle()
         return
@@ -215,9 +291,24 @@ nonisolated private func lunchPadTrackpadContactCallback(
     }
 
     let centers = TrackpadContactClustering.centers(of: points)
-    GestureTouchDiagnostics.shared.noteFrame(
-        raw: rawCount, clusters: centers.count, qualified: centers.count == 4
+    let justArmed = GestureTouchDiagnostics.shared.noteFrame(
+        raw: rawCount, clusters: centers.count, qualified: centers.count == 4, centers: centers
     )
+    if justArmed {
+        // Full raw records once per arm (budgeted): the only reliable way to
+        // locate a size/area field in the undocumented contact layout.
+        var records: [[Float]] = []
+        for index in 0..<min(rawCount, maximumTrackedContacts) {
+            let record = contacts.advanced(by: index * 96)
+            var floats: [Float] = []
+            floats.reserveCapacity(24)
+            for offset in stride(from: 0, to: 96, by: 4) {
+                floats.append(record.load(fromByteOffset: offset, as: Float.self))
+            }
+            records.append(floats)
+        }
+        GestureTouchDiagnostics.shared.noteRawDump(records: records)
+    }
 
     guard centers.count == 4 else {
         // Four or more *distinct* fingers are an attempt at our gesture — keep
