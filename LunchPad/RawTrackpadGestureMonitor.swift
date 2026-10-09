@@ -100,14 +100,35 @@ nonisolated final class GestureTouchDiagnostics: @unchecked Sendable {
     private var armLag: TimeInterval?
     private var initialPairs: [CGFloat] = []
     private var latestCenters: [CGPoint] = []
-    private var rawDumpBudget = 3
+    private var latestRecords: [[Float]] = []
+    private var firstDipFrame: Int?
+    private var rawDumpBudget = 10
+
+    enum FrameAction {
+        case ignore
+        case arm
+        case qualityReject
+    }
+
+    /// A sequence stays believable only while nearly every frame keeps its
+    /// four distinct contacts. Observed distributions: genuine pinches hold
+    /// 97–99.6% qualified frames; palm-interloper sequences sit at 69–82% with
+    /// the dips interleaved from early on. 12% sits in the empty gap between
+    /// the two clusters, and 12 frames (~0.1s) lets the guard trip well before
+    /// a swipe can build commit-level motion.
+    private static let qualityMinimumFrames = 12
+    private static let qualityMaximumDipRatio = 0.12
 
     /// Records one processed frame. Counters only arm once a qualifying
     /// (four-cluster) frame appears, so ordinary one-finger use never accumulates.
-    /// Returns true on the arming frame itself (the caller then dumps raw
-    /// contact records while the budget lasts).
     @discardableResult
-    func noteFrame(raw: Int, clusters: Int, qualified: Bool, centers: [CGPoint]) -> Bool {
+    func noteFrame(
+        raw: Int,
+        clusters: Int,
+        qualified: Bool,
+        centers: [CGPoint],
+        records: [[Float]] = []
+    ) -> FrameAction {
         lock.lock(); defer { lock.unlock() }
         let now = ProcessInfo.processInfo.systemUptime
         if armedSince == nil {
@@ -122,36 +143,46 @@ nonisolated final class GestureTouchDiagnostics: @unchecked Sendable {
                 }
                 lastContactAt = now
             }
-            guard qualified else { return false }
+            guard qualified else { return .ignore }
             armedSince = now
             armLag = episodeStart.map { now - $0 } ?? -1
             initialPairs = Self.sortedPairDistances(centers)
             latestCenters = centers
+            latestRecords = records
             frames += 1
             qualifiedFrames += 1
             rawHistogram[raw, default: 0] += 1
             clusterHistogram[clusters, default: 0] += 1
-            return true
+            if rawDumpBudget > 0 {
+                rawDumpBudget -= 1
+                emitRawDumpLocked(records, tag: "arm")
+            }
+            return .arm
         }
         frames += 1
-        if qualified { qualifiedFrames += 1 }
+        if qualified {
+            qualifiedFrames += 1
+            if centers.count == 4 { latestCenters = centers }
+            if !records.isEmpty { latestRecords = records }
+        } else {
+            if firstDipFrame == nil { firstDipFrame = frames }
+            let dipRatio = 1.0 - Double(qualifiedFrames) / Double(max(frames, 1))
+            if frames >= Self.qualityMinimumFrames, dipRatio > Self.qualityMaximumDipRatio {
+                return .qualityReject
+            }
+        }
         rawHistogram[raw, default: 0] += 1
         clusterHistogram[clusters, default: 0] += 1
-        if centers.count == 4 { latestCenters = centers }
-        return false
+        return .ignore
     }
 
-    /// One full 96-byte contact record per contact, straight after arming —
-    /// used once to locate a size/area field in the private layout.
-    func noteRawDump(records: [[Float]]) {
-        lock.lock(); defer { lock.unlock() }
-        guard rawDumpBudget > 0, !records.isEmpty else { return }
-        rawDumpBudget -= 1
+    private func emitRawDumpLocked(_ records: [[Float]], tag: String) {
+        guard !records.isEmpty else { return }
         let body = records.enumerated().map { index, floats in
             let values = floats.map { String(format: "%.4f", $0) }.joined(separator: ",")
             return "c\(index)=[\(values)]"
         }.joined(separator: " ")
-        LauncherDiagnostics.shared.record("gesture-touch", "raw-record n=\(records.count) \(body)")
+        LauncherDiagnostics.shared.record("gesture-touch", "raw-record \(tag) n=\(records.count) \(body)")
     }
 
     func noteOtherDeviceDrop() {
@@ -164,11 +195,14 @@ nonisolated final class GestureTouchDiagnostics: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard let since = armedSince else { return }
         let now = ProcessInfo.processInfo.systemUptime
+        let qualifiedRatio = Double(qualifiedFrames) / Double(max(frames, 1))
         var line = "end=\(event.outcome.rawValue)"
             + " gen=\(event.generation)"
             + " dur=\(fixed(now - since))"
             + " motion=\(fixed(event.motion))"
             + " frames=\(frames) qualified=\(qualifiedFrames)"
+            + String(format: " qr=%.2f", qualifiedRatio)
+            + " dip@=\(firstDipFrame.map(String.init) ?? "-")"
             + " raw=\(histogramText(rawHistogram))"
             + " clusters=\(histogramText(clusterHistogram))"
             + " other-drops=\(otherDeviceDrops)"
@@ -182,6 +216,13 @@ nonisolated final class GestureTouchDiagnostics: @unchecked Sendable {
                 line += " paird={\(deltas)}"
             }
         }
+        // Sequences worth a raw-record dump without any user cooperation:
+        // real motion, non-pinch topology churn, or a slow palm-style arm.
+        if rawDumpBudget > 0,
+           event.motion >= 0.03 || qualifiedRatio < 0.95 || (armLag ?? 0) > 0.15 {
+            rawDumpBudget -= 1
+            emitRawDumpLocked(latestRecords, tag: "end")
+        }
         armedSince = nil
         frames = 0
         qualifiedFrames = 0
@@ -191,6 +232,8 @@ nonisolated final class GestureTouchDiagnostics: @unchecked Sendable {
         armLag = nil
         initialPairs = []
         latestCenters = []
+        latestRecords = []
+        firstDipFrame = nil
         LauncherDiagnostics.shared.record("gesture-touch", line)
     }
 
@@ -291,13 +334,12 @@ nonisolated private func lunchPadTrackpadContactCallback(
     }
 
     let centers = TrackpadContactClustering.centers(of: points)
-    let justArmed = GestureTouchDiagnostics.shared.noteFrame(
-        raw: rawCount, clusters: centers.count, qualified: centers.count == 4, centers: centers
-    )
-    if justArmed {
-        // Full raw records once per arm (budgeted): the only reliable way to
-        // locate a size/area field in the undocumented contact layout.
-        var records: [[Float]] = []
+    let qualified = centers.count == 4
+    var records: [[Float]] = []
+    if qualified {
+        // Buffered for the interesting-sequence dump: full records of the
+        // four-contact frames, used to locate a size/area field offline.
+        records.reserveCapacity(min(rawCount, maximumTrackedContacts))
         for index in 0..<min(rawCount, maximumTrackedContacts) {
             let record = contacts.advanced(by: index * 96)
             var floats: [Float] = []
@@ -307,10 +349,24 @@ nonisolated private func lunchPadTrackpadContactCallback(
             }
             records.append(floats)
         }
-        GestureTouchDiagnostics.shared.noteRawDump(records: records)
+    }
+    switch GestureTouchDiagnostics.shared.noteFrame(
+        raw: rawCount, clusters: centers.count, qualified: qualified,
+        centers: centers, records: records
+    ) {
+    case .ignore:
+        break
+    case .arm:
+        break // Arming dump already emitted inside noteFrame (budgeted).
+    case .qualityReject:
+        // Too many frames lost their four distinct contacts — a palm-style
+        // interloper sequence, not a pinch. Kill it before motion can commit.
+        TrackpadContactState.shared.rejectContact(at: now)
+        ContactDeviceOwnership.shared.releaseIfIdle()
+        return
     }
 
-    guard centers.count == 4 else {
+    guard qualified else {
         // Four or more *distinct* fingers are an attempt at our gesture — keep
         // the system's own gesture events out until the contact settles.
         // Three distinct fingers (even if raw count was inflated by a split)

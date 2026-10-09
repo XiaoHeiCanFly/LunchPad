@@ -23,6 +23,7 @@ nonisolated final class TrackpadContactState: @unchecked Sendable {
             case topologyTimeout = "topology-timeout"
             case cancelled = "cancel"
             case candidateAbort = "candidate-abort"
+            case qualityAbort = "quality-abort"
         }
         let outcome: Outcome
         let generation: UInt64
@@ -191,6 +192,25 @@ nonisolated final class TrackpadContactState: @unchecked Sendable {
         candidateLastQualifiedAt = nil
         candidateQualifiedDuration = 0
         if contactIsActive { finishContactLocked(outcome: .cancelled) }
+    }
+
+    /// The quality gate rejected the contact topology (too many frames lost
+    /// their four distinct contacts). Disarms a candidate or finishes an
+    /// active contact, and marks the state cancelled so a queued begin cannot
+    /// revive this sequence.
+    func rejectContact(at now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        guard now.isFinite else { return }
+        lock.lock(); defer { lock.unlock() }
+        contactIsCancelled = true
+        if contactIsActive {
+            finishContactLocked(outcome: .qualityAbort)
+            return
+        }
+        if candidateLastQualifiedAt != nil {
+            candidateLastQualifiedAt = nil
+            candidateQualifiedDuration = 0
+            emitTerminalLocked(TerminalEvent(outcome: .qualityAbort, generation: 0, motion: 0))
+        }
     }
 
     private func expireContactIfNeededLocked(now: TimeInterval) {
