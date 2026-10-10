@@ -14,6 +14,12 @@ nonisolated final class TrackpadContactState: @unchecked Sendable {
 
     static let shared = TrackpadContactState()
     static let contactLossGrace: TimeInterval = 0.12
+    /// Net pinch motion (radius units) at which the four-finger gesture is
+    /// unambiguously ours. Mirrors the animator's begin threshold
+    /// (`rawSensitivity 0.095 × 0.02`): below it the contact has claimed
+    /// nothing, so the CGEvent tap must keep passing system gesture events —
+    /// a four-finger spread (negative motion) never crosses this line.
+    static let claimMotion: CGFloat = 0.0019
 
     /// One line of contact-lifecycle telemetry. `candidateAbort` carries
     /// generation 0: no contact ever began.
@@ -80,6 +86,14 @@ nonisolated final class TrackpadContactState: @unchecked Sendable {
     var hasPendingState: Bool {
         lock.lock(); defer { lock.unlock() }
         return contactIsActive || candidateLastQualifiedAt != nil
+    }
+
+    /// True while the live contact's net motion is in the pinch direction and
+    /// past the animator's begin threshold — the system's gesture events may
+    /// be swallowed from this point on, never before.
+    var hasClaimedPinch: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return contactIsActive && accumulatedMotion >= Self.claimMotion
     }
 
     /// Set once before any device frames arrive (monitor `start()`).

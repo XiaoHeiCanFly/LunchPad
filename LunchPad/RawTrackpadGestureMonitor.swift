@@ -327,7 +327,9 @@ nonisolated private func lunchPadTrackpadContactCallback(
         guard x.isFinite, y.isFinite,
               x >= -0.15, x <= 1.15, y >= -0.15, y <= 1.15 else {
             GestureTouchDiagnostics.shared.noteCoordViolation(x: x, y: y, index: index)
-            if rawCount >= 4 { gate.suppress(for: 0.6) }
+            if rawCount >= 4, TrackpadContactState.shared.hasClaimedPinch {
+                gate.suppress(for: 0.6)
+            }
             return
         }
         points.append(CGPoint(x: x, y: y))
@@ -367,11 +369,12 @@ nonisolated private func lunchPadTrackpadContactCallback(
     }
 
     guard qualified else {
-        // Four or more *distinct* fingers are an attempt at our gesture — keep
-        // the system's own gesture events out until the contact settles.
-        // Three distinct fingers (even if raw count was inflated by a split)
-        // belong to the system and must not be suppressed.
-        if centers.count >= 4 { gate.suppress(for: 0.6) }
+        // Four or more *distinct* fingers still matter for the attempt (they
+        // arm the candidate), but system events are only held back once the
+        // pinch claim threshold is crossed — a spread must stay the system's.
+        if centers.count >= 4, TrackpadContactState.shared.hasClaimedPinch {
+            gate.suppress(for: 0.6)
+        }
         TrackpadContactState.shared.endContact(contactCount: centers.count, at: now)
         ContactDeviceOwnership.shared.releaseIfIdle()
         return
@@ -379,7 +382,6 @@ nonisolated private func lunchPadTrackpadContactCallback(
 
     if let device { ContactDeviceOwnership.shared.claim(device) }
     gate.pendingBeginGesture = false
-    gate.suppress(for: 0.6)
 
     var cx: CGFloat = 0, cy: CGFloat = 0
     for center in centers {
@@ -402,6 +404,12 @@ nonisolated private func lunchPadTrackpadContactCallback(
                 LauncherController.shared.rawTrackpadGestureBegan(generation: generation)
             }
         }
+    }
+    // Hold system gestures back only once this contact's motion is
+    // unambiguously a pinch — evaluated after the frame that may have
+    // crossed the threshold.
+    if TrackpadContactState.shared.hasClaimedPinch {
+        gate.suppress(for: 0.6)
     }
     ContactDeviceOwnership.shared.releaseIfIdle()
 }
@@ -518,6 +526,12 @@ final class RawTrackpadGestureMonitor {
 
     nonisolated static var hasFourFingerContact: Bool {
         TrackpadSystemGestureGate.shared.hasFourFingerContact
+    }
+
+    /// The live contact crossed the animator's begin threshold in the pinch
+    /// direction; only now may the tap swallow system gesture events.
+    nonisolated static var hasClaimedPinch: Bool {
+        TrackpadContactState.shared.hasClaimedPinch
     }
 
     /// Recent four-finger activity (including failed attempts) still owns the

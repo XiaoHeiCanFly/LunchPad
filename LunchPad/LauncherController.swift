@@ -779,27 +779,52 @@ final class LauncherController: ObservableObject {
                     }
                     return Unmanaged.passUnretained(event)
                 }
-                // Forensic line for the system-gesture audit: which begin/end
-                // events arrive and what state they saw (rate-limited in the
-                // sink). Logged before any decision so `pending` still shows
-                // the pre-decision value for begins.
-                if type.rawValue == 19 || type.rawValue == 20 {
-                    GestureTouchDiagnostics.shared.noteSystemGesture(
-                        type.rawValue == 19 ? "begin" : "end",
-                        "pending=\(RawTrackpadGestureMonitor.pendingBeginGesture ? 1 : 0)"
-                            + " contact=\(RawTrackpadGestureMonitor.hasFourFingerContact ? 1 : 0)"
-                            + " suppress=\(RawTrackpadGestureMonitor.isSystemGestureSuppressed ? 1 : 0)"
-                            + " presented=\(c.isPresentedOnScreen ? 1 : 0)"
-                    )
-                }
-                // Block system gesture events when presented, during a pinch,
-                // or while a recent four-finger attempt still owns the pad —
-                // a failed pinch must not fall through to the system's own
-                // action for the same contact.
+                // System gesture events (rotate/begin/end/gesture/magnify/swipe).
+                // Swallow them only while OUR gesture has a claim: the launcher
+                // is on screen, the live contact's net motion crossed the pinch
+                // begin threshold, or that claim happened within the last 0.6s.
+                // A four-finger spread (negative motion, launcher closed) never
+                // claims — it passes through to the system untouched.
                 if [18, 19, 20, 29, 30, 31].contains(type.rawValue) {
-                    if c.isPresentedOnScreen { return nil }
-                    if RawTrackpadGestureMonitor.hasFourFingerContact { return nil }
-                    if RawTrackpadGestureMonitor.isSystemGestureSuppressed { return nil }
+                    let presented = c.isPresentedOnScreen
+                    let claimed = RawTrackpadGestureMonitor.hasClaimedPinch
+                    let suppressed = RawTrackpadGestureMonitor.isSystemGestureSuppressed
+                    let swallow = presented || claimed || suppressed
+                    let eventName: String
+                    switch type.rawValue {
+                    case 18: eventName = "rotate"
+                    case 19: eventName = "begin"
+                    case 20: eventName = "end"
+                    case 29: eventName = "gesture"
+                    case 30: eventName = "magnify"
+                    default: eventName = "swipe"
+                    }
+                    GestureTouchDiagnostics.shared.noteSystemGesture(
+                        eventName,
+                        "decision=\(swallow ? "swallow" : "pass")"
+                            + " presented=\(presented ? 1 : 0)"
+                            + " claimed=\(claimed ? 1 : 0)"
+                            + " suppress=\(suppressed ? 1 : 0)"
+                    )
+                    if swallow {
+                        if type.rawValue == 19 {
+                            RawTrackpadGestureMonitor.pendingBeginGesture = true
+                            DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + 0.06) {
+                                if RawTrackpadGestureMonitor.pendingBeginGesture {
+                                    RawTrackpadGestureMonitor.pendingBeginGesture = false
+                                }
+                            }
+                        }
+                        if type.rawValue == 20 {
+                            RawTrackpadGestureMonitor.pendingBeginGesture = false
+                        }
+                        return nil
+                    }
+                    // This gesture belongs to the system; never leave a stale
+                    // pending flag from our own swallowed begins behind.
+                    if type.rawValue == 19 || type.rawValue == 20 {
+                        RawTrackpadGestureMonitor.pendingBeginGesture = false
+                    }
                 }
                 // 拖拽期间把指针拉回启动台所在显示器：图标无法被拖到其他显示器。
                 // 拖拽时鼠标移动以 leftMouseDragged 形式上报，因此一并处理。
@@ -820,20 +845,6 @@ final class LauncherController: ObservableObject {
                             c.store.finishAbandonedDragIfNeeded()
                         }
                     }
-                }
-                // Preemptive beginGesture block with timeout release.
-                if type.rawValue == 19 {
-                    RawTrackpadGestureMonitor.pendingBeginGesture = true
-                    DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + 0.06) {
-                        if RawTrackpadGestureMonitor.pendingBeginGesture {
-                            RawTrackpadGestureMonitor.pendingBeginGesture = false
-                        }
-                    }
-                    return nil
-                }
-                if type.rawValue == 20, RawTrackpadGestureMonitor.pendingBeginGesture {
-                    RawTrackpadGestureMonitor.pendingBeginGesture = false
-                    return nil
                 }
                 // The dock-hover preview panel keeps the background application
                 // inactive, so navigation keys are handled at the session tap.
