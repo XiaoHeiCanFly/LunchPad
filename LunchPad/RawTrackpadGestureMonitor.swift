@@ -45,6 +45,69 @@ private nonisolated final class TrackpadSystemGestureGate: @unchecked Sendable {
     }
 }
 
+/// Show Desktop (entered by the system's four-finger spread) outranks our
+/// pinch. After a deliberate spread, if the next four-contact sequence starts
+/// with zero normal windows on screen — the signature of Show Desktop — the
+/// sequence yields: no animator dispatch, no event swallowing, so the
+/// system's own pinch dismisses the desktop first. Seeing any window again
+/// clears the armed state.
+private nonisolated final class DesktopYieldGate: @unchecked Sendable {
+    static let shared = DesktopYieldGate()
+    /// Net radius change that marks a deliberate spread (about half the
+    /// animator's full-open sensitivity — well past jitter).
+    static let spreadMotion: CGFloat = 0.01
+
+    private let lock = NSLock()
+    private var spreadSeen = false
+    private var yieldsForSequence = false
+
+    func noteDeliberateSpread() {
+        lock.lock(); defer { lock.unlock() }
+        spreadSeen = true
+    }
+
+    /// Called once per sequence, on the arming frame.
+    func evaluateSequenceStart() {
+        lock.lock(); defer { lock.unlock() }
+        let count = Self.onScreenNormalWindowCount()
+        if count > 0 {
+            spreadSeen = false
+            yieldsForSequence = false
+        } else {
+            yieldsForSequence = spreadSeen
+            if spreadSeen {
+                // Logged while armed so a no-yield outcome (windows still
+                // listed during Show Desktop) is diagnosable too.
+                LauncherDiagnostics.shared.record(
+                    "gesture-touch",
+                    "desktop-check count=\(count) spread=1 yields=\(yieldsForSequence ? 1 : 0)"
+                )
+            }
+        }
+    }
+
+    var yields: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return yieldsForSequence
+    }
+
+    func endSequence() {
+        lock.lock(); defer { lock.unlock() }
+        yieldsForSequence = false
+    }
+
+    /// Normal (layer 0) windows currently on screen. Query failure reports
+    /// `Int.max` so a broken call can never wrongly suppress our own gesture.
+    private static func onScreenNormalWindowCount() -> Int {
+        guard let list = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return Int.max
+        }
+        return list.filter { ($0[kCGWindowLayer as String] as? Int) == 0 }.count
+    }
+}
+
 /// Pins the contact state machine to the trackpad that produced the
 /// qualifying frames. A second device's empty frames must never interleave:
 /// they would end the first device's gesture through the grace path.
@@ -359,7 +422,9 @@ nonisolated private func lunchPadTrackpadContactCallback(
     case .ignore:
         break
     case .arm:
-        break // Arming dump already emitted inside noteFrame (budgeted).
+        // Arming dump already emitted inside noteFrame (budgeted); decide
+        // now whether this sequence yields to Show Desktop.
+        DesktopYieldGate.shared.evaluateSequenceStart()
     case .qualityReject:
         // Too many frames lost their four distinct contacts — a palm-style
         // interloper sequence, not a pinch. Kill it before motion can commit.
@@ -398,7 +463,12 @@ nonisolated private func lunchPadTrackpadContactCallback(
     // Wake the main-thread animator once per contact sequence. This is a
     // single hop per gesture — never per frame. The generation prevents a
     // delayed wakeup from attaching itself to a later set of fingers.
-    if let generation = TrackpadContactState.shared.noteQualifiedFrame(radius: radius, at: now) {
+    if let snap = TrackpadContactState.shared.snapshot(),
+       snap.motion <= -DesktopYieldGate.spreadMotion {
+        DesktopYieldGate.shared.noteDeliberateSpread()
+    }
+    if let generation = TrackpadContactState.shared.noteQualifiedFrame(radius: radius, at: now),
+       !DesktopYieldGate.shared.yields {
         DispatchQueue.main.async {
             MainActor.assumeIsolated {
                 LauncherController.shared.rawTrackpadGestureBegan(generation: generation)
@@ -407,8 +477,8 @@ nonisolated private func lunchPadTrackpadContactCallback(
     }
     // Hold system gestures back only once this contact's motion is
     // unambiguously a pinch — evaluated after the frame that may have
-    // crossed the threshold.
-    if TrackpadContactState.shared.hasClaimedPinch {
+    // crossed the threshold. While yielding, the system keeps everything.
+    if TrackpadContactState.shared.hasClaimedPinch, !DesktopYieldGate.shared.yields {
         gate.suppress(for: 0.6)
     }
     ContactDeviceOwnership.shared.releaseIfIdle()
@@ -460,6 +530,7 @@ final class RawTrackpadGestureMonitor {
 
         TrackpadContactState.shared.setTerminalEventHandler { event in
             GestureTouchDiagnostics.shared.noteTerminal(event)
+            DesktopYieldGate.shared.endSequence()
         }
         refreshDevices(reason: "start", restart: false)
         isRunning = true
@@ -529,9 +600,16 @@ final class RawTrackpadGestureMonitor {
     }
 
     /// The live contact crossed the animator's begin threshold in the pinch
-    /// direction; only now may the tap swallow system gesture events.
+    /// direction; only now may the tap swallow system gesture events. While a
+    /// sequence yields to Show Desktop, never — the system's exit pinch has
+    /// priority.
     nonisolated static var hasClaimedPinch: Bool {
-        TrackpadContactState.shared.hasClaimedPinch
+        TrackpadContactState.shared.hasClaimedPinch && !DesktopYieldGate.shared.yields
+    }
+
+    /// True while the current sequence defers to Show Desktop.
+    nonisolated static var yieldsToDesktop: Bool {
+        DesktopYieldGate.shared.yields
     }
 
     /// Recent four-finger activity (including failed attempts) still owns the

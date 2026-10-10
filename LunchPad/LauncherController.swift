@@ -805,6 +805,7 @@ final class LauncherController: ObservableObject {
                             + " presented=\(presented ? 1 : 0)"
                             + " claimed=\(claimed ? 1 : 0)"
                             + " suppress=\(suppressed ? 1 : 0)"
+                            + " yield=\(RawTrackpadGestureMonitor.yieldsToDesktop ? 1 : 0)"
                     )
                     if swallow {
                         if type.rawValue == 19 {
