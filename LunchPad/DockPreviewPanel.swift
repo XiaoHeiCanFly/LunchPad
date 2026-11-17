@@ -34,6 +34,17 @@ final class DockPreviewPanel: NSPanel {
     /// 鼠标移出图标后等待隐藏；期间抑制所有其他逻辑。
     private(set) var pendingHide = false
     private var pendingHideWorkItem: DispatchWorkItem?
+    private var closeResizeGraceDeadline: DispatchTime?
+
+    var isDelayingHoverDismissal: Bool {
+        guard let closeResizeGraceDeadline else { return false }
+        return DispatchTime.now() < closeResizeGraceDeadline
+    }
+
+    var isPointerOverPreview: Bool {
+        let padding = HoverContainerPadding.container
+        return frame.insetBy(dx: padding, dy: padding).contains(NSEvent.mouseLocation)
+    }
 
     private var previousHoverWindowOrigin: CGPoint?
     private var currentDockPosition: DockPosition = .bottom
@@ -69,15 +80,16 @@ final class DockPreviewPanel: NSPanel {
         pendingShowWorkItem = nil
     }
 
-    /// 鼠标移出图标后 0.15s 隐藏窗口。期间 `pendingHide` 为 true，抑制所有其他逻辑。
+    /// 鼠标移出图标后短暂等待，让指针有时间进入预览。
     func schedulePendingHide() {
-        guard !pendingHide else { return }
+        guard !pendingHide, !isDelayingHoverDismissal else { return }
         pendingHide = true
         pendingHideWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self, self.pendingHide else { return }
-                self.pendingHide = false
+                self.cancelPendingHide()
+                guard !self.isDelayingHoverDismissal, !self.isPointerOverPreview else { return }
                 self.hideWindow(animated: true)
             }
         }
@@ -96,6 +108,7 @@ final class DockPreviewPanel: NSPanel {
             cancelPendingShow()
         }
         cancelPendingHide()
+        closeResizeGraceDeadline = nil
         guard isVisible else { return }
 
         let cleanup = { [weak self] in
@@ -219,6 +232,7 @@ final class DockPreviewPanel: NSPanel {
     ) {
         guard !windows.isEmpty else { return }
 
+        closeResizeGraceDeadline = nil
         let screen = mouseScreen ?? NSScreen.main ?? NSScreen.screens[0]
         currentPreviewScreen = screen
         let activeDockPosition = DockUtils.getDockPosition()
@@ -307,6 +321,40 @@ final class DockPreviewPanel: NSPanel {
         state.windows = windows
         refreshPanelFrameToFitContent()
         return true
+    }
+
+    /// Removes one closed window from the live preview without dismissing the
+    /// whole panel. Closing used to share the same callback as activating a
+    /// window, which ordered the panel out and forced the user to hover the Dock
+    /// icon again before they could act on another window.
+    func removeClosedWindow(id windowID: CGWindowID) {
+        guard let removedIndex = state.windows.firstIndex(where: { $0.id == windowID }) else { return }
+
+        if state.windows.count > 1 {
+            // Start before publishing the shorter list, since either layout
+            // or the frame animation can move the glass away from the pointer.
+            cancelPendingHide()
+            closeResizeGraceDeadline = .now() + 0.6
+        }
+        state.windows.remove(at: removedIndex)
+        if state.windows.isEmpty {
+            hideWindow(animated: true)
+            return
+        }
+
+        if state.selectionIndex > removedIndex {
+            state.selectionIndex -= 1
+        } else if state.selectionIndex == removedIndex {
+            state.selectionIndex = min(removedIndex, state.windows.count - 1)
+        }
+
+        // Let SwiftUI commit the shorter card list before asking the hosting
+        // view for its new fitting size. The dock-anchored edge remains fixed.
+        Task { @MainActor [weak self, weak preview = contentView] in
+            await Task.yield()
+            guard let self, let preview, self.contentView === preview else { return }
+            self.refreshPanelFrameToFitContent()
+        }
     }
 
     // MARK: - Keyboard navigation

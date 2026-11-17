@@ -907,7 +907,7 @@ struct DockPreviewHoverContainer: View {
             onWindowTap?()
         case .close:
             window.closeWindow()
-            onWindowTap?()
+            DockPreviewPanel.shared.removeClosedWindow(id: window.id)
         case .minimize:
             var updated = window
             if updated.toggleMinimize() != nil {
@@ -1069,15 +1069,17 @@ final class DockPreviewTrackingView: NSView {
     }
 
     private func checkInactivity() {
-        // 隐藏挂起中：不做任何事。
-        if DockPreviewPanel.shared.pendingHide { return }
-        guard let window else { return }
-        let currentMouseLocation = NSEvent.mouseLocation
-        let windowFrame = window.frame.insetBy(dx: HoverContainerPadding.container, dy: HoverContainerPadding.container)
+        let panel = DockPreviewPanel.shared
+        guard window === panel, !isHiding, !panel.pendingHide else { return }
+        if panel.isDelayingHoverDismissal {
+            if fadeOutTimer != nil {
+                cancelFadeOut()
+                setWindowOpacity(to: 1, duration: 0)
+            }
+            return
+        }
 
-        let isMouseOverDockIcon = checkIfMouseIsOverDockIcon()
-
-        if windowFrame.contains(currentMouseLocation) || isMouseOverDockIcon {
+        if panel.isPointerOverPreview || checkIfMouseIsOverDockIcon() {
             resetOpacityVisually()
         } else {
             // 鼠标不在窗口内也不在图标上 → 直接隐藏。
@@ -1117,7 +1119,8 @@ final class DockPreviewTrackingView: NSView {
         DispatchQueue.main.async { [weak self] in
             guard let self,
                   let window,
-                  window.alphaValue > 0
+                  window.alphaValue > 0,
+                  !DockPreviewPanel.shared.isDelayingHoverDismissal
             else { return }
 
             cancelFadeOut()
@@ -1152,7 +1155,9 @@ final class DockPreviewTrackingView: NSView {
     }
 
     private func performHideWindow() {
+        let panel = DockPreviewPanel.shared
+        guard window === panel, !panel.isDelayingHoverDismissal else { return }
         isHiding = true
-        DockPreviewPanel.shared.hideWindow(animated: true)
+        panel.hideWindow(animated: true)
     }
 }
