@@ -1531,6 +1531,7 @@ private struct FolderOverlay: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let folder: LauncherFolder
     @State private var name: String = ""
+    @FocusState private var nameIsFocused: Bool
     /// A spring-loaded folder is inserted while AppKit owns a dragging run loop.
     /// Waiting for `onAppear` to flip this from false can leave the root hidden
     /// and the overlay transparent until the pointer moves again. The parent
@@ -1544,14 +1545,9 @@ private struct FolderOverlay: View {
         // it here makes every drag callback and grid pass use that live order.
         let liveFolder = store.folder(id: folder.id) ?? folder
         GeometryReader { proxy in
-            let panelWidth = max(360, min(proxy.size.width - 40, proxy.size.width * 0.88))
-            let horizontalPadding = min(72, max(24, panelWidth * 0.045))
-            let horizontalSpacing = min(44, max(18, panelWidth * 0.024))
-            let availableWidth = panelWidth - horizontalPadding * 2
-            let columnCount = max(3, min(7, Int((availableWidth + horizontalSpacing) / 145)))
-            let cellWidth = (availableWidth - CGFloat(columnCount - 1) * horizontalSpacing) / CGFloat(columnCount)
-            let folderIconSize = min(110, max(58, cellWidth * 0.62))
-            let rowCount = max(1, Int(ceil(Double(liveFolder.applications.count) / Double(columnCount))))
+            let layout = FolderGridLayout(containerWidth: proxy.size.width)
+            let folderIconSize = min(110, max(58, layout.cellWidth * 0.62))
+            let rowCount = max(1, Int(ceil(Double(liveFolder.applications.count) / Double(layout.columns))))
             let requiredHeight = CGFloat(rowCount) * (folderIconSize + 40)
                 + CGFloat(max(0, rowCount - 1)) * 24 + 64
             let panelHeight = min(max(190, requiredHeight), proxy.size.height * 0.56)
@@ -1568,61 +1564,67 @@ private struct FolderOverlay: View {
                 VStack(spacing: 30) {
                     TextField("文件夹名称", text: $name)
                         .textFieldStyle(.plain)
+                        .focused($nameIsFocused)
                         .font(.system(size: min(26, max(19, proxy.size.width * 0.013)), weight: .medium))
                         .foregroundStyle(.white.opacity(0.92))
                         .multilineTextAlignment(.center)
                         // The field is empty during its first layout pass and
                         // AppKit otherwise reports a height that is too short
                         // once the folder name is assigned in onAppear.
-                        .frame(width: min(420, panelWidth * 0.42), height: 42)
+                        .frame(width: min(420, layout.panelWidth * 0.42), height: 42)
                         .fixedSize(horizontal: false, vertical: true)
                         .onSubmit { store.renameFolder(id: folder.id, name: name) }
 
-                    ScrollView(.vertical, showsIndicators: false) {
-                        LazyVGrid(
-                            columns: Array(
-                                repeating: GridItem(.flexible(minimum: 58), spacing: horizontalSpacing),
-                                count: columnCount
-                            ),
-                            spacing: 24
-                        ) {
-                            ForEach(liveFolder.applications) { application in
-                                FolderApplicationTile(
-                                    application: application,
-                                    folderID: folder.id,
-                                    iconSize: folderIconSize,
-                                    tileWidth: cellWidth,
-                                    store: store,
-                                    controller: controller,
-                                    optionIsPressed: store.optionIsPressed,
-                                    isDragged: store.draggedEntryID == application.id
-                                        && store.draggedSourceFolderID == folder.id,
-                                    isFolderDropTarget: store.draggedEntryID != nil
-                                        && store.draggedEntryID != application.id
-                                        && store.dragTargetID == application.id
-                                )
-                                .equatable()
+                    ScrollViewReader { scroll in
+                        ScrollView(.vertical, showsIndicators: false) {
+                            LazyVGrid(
+                                columns: Array(
+                                    repeating: GridItem(.flexible(minimum: 58), spacing: layout.horizontalSpacing),
+                                    count: layout.columns
+                                ),
+                                spacing: 24
+                            ) {
+                                ForEach(liveFolder.applications) { application in
+                                    FolderApplicationTile(
+                                        application: application,
+                                        folderID: folder.id,
+                                        iconSize: folderIconSize,
+                                        tileWidth: layout.cellWidth,
+                                        store: store,
+                                        controller: controller,
+                                        optionIsPressed: store.optionIsPressed,
+                                        isSelected: store.selectedFolderApplicationID == application.id,
+                                        isDragged: store.draggedEntryID == application.id
+                                            && store.draggedSourceFolderID == folder.id,
+                                        isFolderDropTarget: store.draggedEntryID != nil
+                                            && store.draggedEntryID != application.id
+                                            && store.dragTargetID == application.id
+                                    )
+                                    .equatable()
+                                    .id(application.id)
+                                }
                             }
+                            // Keep repeated drag reorders short and non-bouncy.
+                            .animation(
+                                reduceMotion
+                                    ? nil
+                                    : (store.draggedEntryID == nil
+                                        ? .spring(response: 0.36, dampingFraction: 0.82, blendDuration: 0.12)
+                                        : .easeOut(duration: 0.12)),
+                                value: liveFolder.applications.map(\.id)
+                            )
+                            .padding(.horizontal, layout.horizontalPadding)
+                            .padding(.vertical, 32)
                         }
-                        // During an active drag use a short, non-bouncy move.
-                        // Repeated springs accumulate velocity and are the main
-                        // source of lag when rapidly crossing several slots.
-                        .animation(
-                            reduceMotion
-                                ? nil
-                                : (store.draggedEntryID == nil
-                                    ? .spring(response: 0.36, dampingFraction: 0.82, blendDuration: 0.12)
-                                    : .easeOut(duration: 0.12)),
-                            value: liveFolder.applications.map(\.id)
-                        )
-                        .padding(.horizontal, horizontalPadding)
-                        .padding(.vertical, 32)
+                        .onChange(of: store.selectedFolderApplicationID) { _, selectedID in
+                            if let selectedID { scroll.scrollTo(selectedID) }
+                        }
                     }
                     // Once an icon drag has begun the scroll view must not
                     // compete for the same pointer stream. It otherwise wins
                     // intermittently and folder DropDelegates stop updating.
                     .scrollDisabled(store.draggedEntryID != nil)
-                    .frame(width: panelWidth, height: panelHeight)
+                    .frame(width: layout.panelWidth, height: panelHeight)
                     .background(.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 38, style: .continuous))
                     .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 38, style: .continuous))
                     .overlay {
@@ -1657,6 +1659,9 @@ private struct FolderOverlay: View {
                 store.folderOverlayIsDimmed = true
             }
         }
+        .onChange(of: nameIsFocused) { _, focused in
+            if store.openFolderID == folder.id { store.isEditingFolderName = focused }
+        }
         .onDisappear {
             store.renameFolder(id: folder.id, name: name)
             store.folderOverlayIsDimmed = false
@@ -1685,6 +1690,7 @@ private struct FolderApplicationTile: View, Equatable {
     let store: LauncherStore
     let controller: LauncherController
     let optionIsPressed: Bool
+    let isSelected: Bool
     let isDragged: Bool
     let isFolderDropTarget: Bool
 
@@ -1696,6 +1702,7 @@ private struct FolderApplicationTile: View, Equatable {
             && lhs.store === rhs.store
             && lhs.controller === rhs.controller
             && lhs.optionIsPressed == rhs.optionIsPressed
+            && lhs.isSelected == rhs.isSelected
             && lhs.isDragged == rhs.isDragged
             && lhs.isFolderDropTarget == rhs.isFolderDropTarget
     }
@@ -1729,6 +1736,12 @@ private struct FolderApplicationTile: View, Equatable {
                     }
                     .contentShape(RoundedRectangle(cornerRadius: iconSize * 0.22, style: .continuous))
                     .onTapGesture { controller.launch(application) }
+                    .background {
+                        if isSelected {
+                            GlassSelectionHighlight(size: iconSize + 14)
+                                .allowsHitTesting(false)
+                        }
+                    }
                 if optionIsPressed, !application.isProtected {
                     Button { store.requestUninstall(application) } label: {
                         Image(systemName: "xmark.circle.fill")

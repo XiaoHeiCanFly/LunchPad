@@ -696,6 +696,32 @@ final class LauncherController: ObservableObject {
             else { hide() }
             return nil
         }
+        if isPresented, let folderID = store.openFolderID {
+            guard event.window is LauncherPanel, !event.modifierFlags.contains(.command),
+                  !store.isEditingFolderName, store.uninstallRequest == nil,
+                  store.aliasRequest == nil, store.errorMessage == nil, !store.reorderToCustomPrompt,
+                  let folder = store.folder(id: folderID), let frame = presentedWindowFrame
+            else { return event }
+
+            let direction: ArrowDirection
+            switch Int(event.keyCode) {
+            case kVK_LeftArrow: direction = .left
+            case kVK_RightArrow: direction = .right
+            case kVK_UpArrow: direction = .up
+            case kVK_DownArrow: direction = .down
+            case kVK_Return, kVK_ANSI_KeypadEnter:
+                if let application = folder.applications.first(where: { $0.id == store.selectedFolderApplicationID }) {
+                    // Holding Return to enter the folder must not immediately
+                    // launch its first application on the key repeat.
+                    if !event.isARepeat { launch(application) }
+                }
+                return nil
+            default: return event
+            }
+            store.moveFolderSelection(in: folder, direction: direction,
+                                      columns: FolderGridLayout(containerWidth: frame.width).columns)
+            return nil
+        }
         if event.modifierFlags.contains(.command), event.keyCode == UInt16(kVK_LeftArrow) {
             store.pageBackward(); return nil
         }
@@ -712,7 +738,7 @@ final class LauncherController: ObservableObject {
                 if let entry = store.selectedEntry {
                     switch entry {
                     case .application(let app): launch(app)
-                    case .folder(let folder): store.openFolder(folder)
+                    case .folder(let folder): store.openFolder(folder, selectFirstApplication: true)
                     }
                     return nil
                 }

@@ -79,6 +79,25 @@ enum LauncherEntry: Codable, Hashable, Identifiable, Sendable {
     }
 }
 
+/// Shared by the folder overlay and keyboard navigation so vertical movement
+/// follows the grid on every display width.
+struct FolderGridLayout {
+    let panelWidth: CGFloat
+    let horizontalPadding: CGFloat
+    let horizontalSpacing: CGFloat
+    let columns: Int
+    let cellWidth: CGFloat
+
+    init(containerWidth: CGFloat) {
+        panelWidth = max(360, min(containerWidth - 40, containerWidth * 0.88))
+        horizontalPadding = min(72, max(24, panelWidth * 0.045))
+        horizontalSpacing = min(44, max(18, panelWidth * 0.024))
+        let availableWidth = panelWidth - horizontalPadding * 2
+        columns = max(3, min(7, Int((availableWidth + horizontalSpacing) / 145)))
+        cellWidth = (availableWidth - CGFloat(columns - 1) * horizontalSpacing) / CGFloat(columns)
+    }
+}
+
 struct UninstallRequest: Identifiable {
     let application: LauncherApplication
     var id: String { application.id }
@@ -91,7 +110,15 @@ final class LauncherStore: ObservableObject {
     @Published var currentPage = UserDefaults.standard.integer(forKey: "last-page") {
         didSet { UserDefaults.standard.set(currentPage, forKey: "last-page") }
     }
-    @Published var openFolderID: UUID?
+    @Published var openFolderID: UUID? {
+        didSet {
+            guard oldValue != openFolderID else { return }
+            selectedFolderApplicationID = nil
+            isEditingFolderName = false
+        }
+    }
+    @Published private(set) var selectedFolderApplicationID: String?
+    var isEditingFolderName = false
     @Published var folderOverlayIsDimmed = false
     @Published var optionIsPressed = false
     @Published var isScanning = true
@@ -773,9 +800,12 @@ final class LauncherStore: ObservableObject {
         try? url.resourceValues(forKeys: [.creationDateKey]).creationDate
     }
 
-    func openFolder(_ folder: LauncherFolder) {
+    func openFolder(_ folder: LauncherFolder, selectFirstApplication: Bool = false) {
         recordFolderOpen(folder)
         openFolderID = folder.id
+        if selectFirstApplication {
+            selectedFolderApplicationID = folder.applications.first?.id
+        }
     }
 
     func requestAlias(for application: LauncherApplication) {
@@ -1934,6 +1964,26 @@ final class LauncherStore: ObservableObject {
         let nextIndex = min(display.count - 1, max(0, currentIndex + delta))
         selectedEntryID = display[nextIndex].id
         currentPage = nextIndex / size
+    }
+
+    func moveFolderSelection(in folder: LauncherFolder, direction: ArrowDirection, columns: Int) {
+        let applications = folder.applications
+        guard let first = applications.first else { return }
+        guard let index = applications.firstIndex(where: { $0.id == selectedFolderApplicationID }) else {
+            selectedFolderApplicationID = first.id
+            return
+        }
+        let lastIndex = applications.count - 1
+        let nextIndex: Int
+        switch direction {
+        case .left: nextIndex = max(0, index - 1)
+        case .right: nextIndex = min(lastIndex, index + 1)
+        case .up: nextIndex = index >= columns ? index - columns : index
+        case .down:
+            let nextRowStart = (index / columns + 1) * columns
+            nextIndex = nextRowStart <= lastIndex ? min(lastIndex, index + columns) : index
+        }
+        if nextIndex != index { selectedFolderApplicationID = applications[nextIndex].id }
     }
 
     func exportLayout() {
