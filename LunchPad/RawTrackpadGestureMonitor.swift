@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import Darwin
 
 private typealias MTDeviceRef = UnsafeMutableRawPointer
@@ -31,6 +32,11 @@ private nonisolated final class TrackpadSystemGestureGate: @unchecked Sendable {
         lock.unlock()
     }
 
+    func clearSuppression() {
+        lock.lock(); defer { lock.unlock() }
+        suppressUntil = .distantPast
+    }
+
     /// True while a four-finger attempt was seen recently — including the
     /// window after a failed attempt where fingers are still on the pad. The
     /// CGEvent tap must keep swallowing system gestures there, or the system
@@ -45,66 +51,57 @@ private nonisolated final class TrackpadSystemGestureGate: @unchecked Sendable {
     }
 }
 
-/// Show Desktop (entered by the system's four-finger spread) outranks our
-/// pinch. After a deliberate spread, if the next four-contact sequence starts
-/// with zero normal windows on screen — the signature of Show Desktop — the
-/// sequence yields: no animator dispatch, no event swallowing, so the
-/// system's own pinch dismisses the desktop first. Seeing any window again
-/// clears the armed state.
+/// Shares desktop handoff state between the touch callback and event tap.
 private nonisolated final class DesktopYieldGate: @unchecked Sendable {
     static let shared = DesktopYieldGate()
-    /// Net radius change that marks a deliberate spread (about half the
-    /// animator's full-open sensitivity — well past jitter).
-    static let spreadMotion: CGFloat = 0.01
 
     private let lock = NSLock()
-    private var spreadSeen = false
-    private var yieldsForSequence = false
+    private var handoff = DesktopGestureHandoff()
 
-    func noteDeliberateSpread() {
+    func noteSpread(_ motion: CGFloat) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        spreadSeen = true
+        let wasYielding = handoff.yields
+        handoff.noteMotion(motion)
+        return !wasYielding && handoff.yields
     }
 
-    /// Called once per sequence, on the arming frame.
-    func evaluateSequenceStart() {
+    func beginSequence(launcherPresented: Bool) -> Bool {
+        // The system setting defaults to enabled when Dock has no override.
+        let dockPreferences = UserDefaults.standard.persistentDomain(forName: "com.apple.dock")
+        let enabled = dockPreferences?["showDesktopGestureEnabled"] as? Bool ?? true
         lock.lock(); defer { lock.unlock() }
-        let count = Self.onScreenNormalWindowCount()
-        if count > 0 {
-            spreadSeen = false
-            yieldsForSequence = false
-        } else {
-            yieldsForSequence = spreadSeen
-            if spreadSeen {
-                // Logged while armed so a no-yield outcome (windows still
-                // listed during Show Desktop) is diagnosable too.
-                LauncherDiagnostics.shared.record(
-                    "gesture-touch",
-                    "desktop-check count=\(count) spread=1 yields=\(yieldsForSequence ? 1 : 0)"
-                )
-            }
-        }
+        handoff.begin(launcherPresented: launcherPresented, desktopGestureEnabled: enabled)
+        return handoff.yields
     }
 
     var yields: Bool {
         lock.lock(); defer { lock.unlock() }
-        return yieldsForSequence
+        return handoff.yields
     }
 
-    func endSequence() {
+    var pendingRestoreGeneration: UInt64? {
         lock.lock(); defer { lock.unlock() }
-        yieldsForSequence = false
+        return handoff.pendingRestoreGeneration
     }
 
-    /// Normal (layer 0) windows currently on screen. Query failure reports
-    /// `Int.max` so a broken call can never wrongly suppress our own gesture.
-    private static func onScreenNormalWindowCount() -> Int {
-        guard let list = CGWindowListCopyWindowInfo(
-            [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
-        ) as? [[String: Any]] else {
-            return Int.max
+    @discardableResult
+    func noteExternalExit(_ reason: String, for generation: UInt64? = nil) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard handoff.noteExternalExit(for: generation) else { return false }
+        LauncherDiagnostics.shared.record("gesture-touch", "desktop-handoff external-exit reason=\(reason)")
+        return true
+    }
+
+    func endSequence(_ event: TrackpadContactState.TerminalEvent) {
+        lock.lock(); defer { lock.unlock() }
+        let wasYielding = handoff.yields
+        handoff.end(event)
+        if wasYielding {
+            LauncherDiagnostics.shared.record(
+                "gesture-touch",
+                "desktop-handoff end=\(event.outcome.rawValue) gen=\(event.generation) awaits-restore=\(handoff.awaitsRestore ? 1 : 0)"
+            )
         }
-        return list.filter { ($0[kCGWindowLayer as String] as? Int) == 0 }.count
     }
 }
 
@@ -397,12 +394,8 @@ nonisolated private func lunchPadTrackpadContactCallback(
     case .ignore:
         break
     case .arm:
-        // Arming dump already emitted inside noteFrame (budgeted); decide
-        // now whether this sequence yields to Show Desktop.
-        if presented {
-            desktopGate.endSequence()
-        } else {
-            desktopGate.evaluateSequenceStart()
+        if desktopGate.beginSequence(launcherPresented: presented) {
+            gate.clearSuppression()
         }
     }
 
@@ -423,8 +416,9 @@ nonisolated private func lunchPadTrackpadContactCallback(
     )
     if !presented, !contact.hasClaimedGesture,
        let sample = contact.snapshot(at: now), sample.contactActive,
-       sample.motion <= -DesktopYieldGate.spreadMotion {
-        desktopGate.noteDeliberateSpread()
+       sample.motion <= -DesktopGestureHandoff.deliberateMotion,
+       desktopGate.noteSpread(sample.motion) {
+        gate.clearSuppression()
     }
     // One hop when this contact claims the gesture, including any motion
     // measured while the four contacts were still being confirmed.
@@ -460,6 +454,7 @@ final class RawTrackpadGestureMonitor {
     private var trackedDevices: [MTDeviceRef] = []
     private var sleepObserver: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
+    private var activationObserver: NSObjectProtocol?
 
     private init() {}
 
@@ -490,7 +485,7 @@ final class RawTrackpadGestureMonitor {
 
         TrackpadContactState.shared.setTerminalEventHandler { event in
             GestureTouchDiagnostics.shared.noteTerminal(event)
-            DesktopYieldGate.shared.endSequence()
+            DesktopYieldGate.shared.endSequence(event)
         }
         refreshDevices(reason: "start", restart: false)
         isRunning = true
@@ -507,6 +502,18 @@ final class RawTrackpadGestureMonitor {
         ) { _ in
             MainActor.assumeIsolated {
                 RawTrackpadGestureMonitor.shared.handleWake()
+            }
+        }
+        activationObserver = center.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { notification in
+            MainActor.assumeIsolated {
+                guard !LauncherController.isPresentedOnScreen,
+                      let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                      app.activationPolicy == .regular,
+                      app.processIdentifier != ProcessInfo.processInfo.processIdentifier,
+                      app.bundleIdentifier != "com.apple.finder" else { return }
+                DesktopYieldGate.shared.noteExternalExit("application-activated")
             }
         }
     }
@@ -567,6 +574,41 @@ final class RawTrackpadGestureMonitor {
     /// True while the current sequence defers to Show Desktop.
     nonisolated static var yieldsToDesktop: Bool {
         DesktopYieldGate.shared.yields
+    }
+
+    @discardableResult
+    nonisolated static func noteDesktopEscape() -> Bool {
+        guard !LauncherController.isPresentedOnScreen else { return false }
+        return DesktopYieldGate.shared.noteExternalExit("escape")
+    }
+
+    nonisolated static func checkDesktopExitClick(at point: CGPoint, clickCount: Int64) {
+        guard !LauncherController.isPresentedOnScreen,
+              let generation = DesktopYieldGate.shared.pendingRestoreGeneration else { return }
+        // AX takes a cross-process round trip. Keep it off the UI and event-tap threads.
+        DispatchQueue.global(qos: .userInitiated).async {
+            let gate = DesktopYieldGate.shared
+            guard gate.pendingRestoreGeneration == generation,
+                  !LauncherController.isPresentedOnScreen else { return }
+
+            let system = AXUIElementCreateSystemWide()
+            var hit: AXUIElement?
+            guard AXUIElementCopyElementAtPosition(system, Float(point.x), Float(point.y), &hit) == .success,
+                  let hit else { return }
+
+            AXUIElementSetMessagingTimeout(hit, 0.10)
+            if (try? hit.subrole()) == "AXApplicationDockItem" {
+                gate.noteExternalExit("dock-application", for: generation)
+            } else if clickCount >= 2 {
+                // Finder may already be the foreground app when opening a
+                // desktop folder, so it won't always issue an activation event.
+                var pid: pid_t = 0
+                guard AXUIElementGetPid(hit, &pid) == .success,
+                      NSRunningApplication(processIdentifier: pid)?.bundleIdentifier == "com.apple.finder"
+                else { return }
+                gate.noteExternalExit("finder-double-click", for: generation)
+            }
+        }
     }
 
     /// Recent four-finger activity (including failed attempts) still owns the

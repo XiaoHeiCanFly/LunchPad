@@ -867,12 +867,18 @@ final class LauncherController: ObservableObject {
                 // chance to deliver a valid destination drop on the main run
                 // loop. This prevents the launcher remaining stuck in drag UI.
                 if type == .leftMouseUp {
+                    RawTrackpadGestureMonitor.checkDesktopExitClick(
+                        at: event.location, clickCount: event.getIntegerValueField(.mouseEventClickState)
+                    )
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
                         MainActor.assumeIsolated {
                             c.store.finishAbandonedDragIfNeeded()
                         }
                     }
                 }
+                let desktopEscape = type == .keyDown
+                    && event.getIntegerValueField(.keyboardEventKeycode) == Int64(kVK_Escape)
+                    && RawTrackpadGestureMonitor.noteDesktopEscape()
                 // The dock-hover preview panel keeps the background application
                 // inactive, so navigation keys are handled at the session tap.
                 if type == .keyDown, DockPreviewPanel.isPresentedOnScreen {
@@ -888,9 +894,10 @@ final class LauncherController: ObservableObject {
                                 }
                             }
                         }
-                        return nil
+                        return desktopEscape ? Unmanaged.passUnretained(event) : nil
                     }
                 }
+                if desktopEscape { return Unmanaged.passUnretained(event) }
                 // keyDown: trigger the configured shortcut even when the app is
                 // backgrounded. The trigger is dispatched async — never sync.
                 if type == .keyDown, c.matchesConfiguredShortcut(event) {

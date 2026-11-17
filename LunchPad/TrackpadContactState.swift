@@ -1,5 +1,57 @@
 import Foundation
 
+/// Gives macOS the inverse gesture after a completed Show Desktop spread.
+/// Window enumeration doesn't expose the desktop gesture's presentation state.
+nonisolated struct DesktopGestureHandoff {
+    static let deliberateMotion: CGFloat = 0.035
+
+    private enum Sequence { case inactive, watchingForSpread, spreading, restoring }
+    private var sequence = Sequence.inactive
+    private(set) var pendingRestoreGeneration: UInt64?
+
+    var awaitsRestore: Bool { pendingRestoreGeneration != nil }
+    var yields: Bool { sequence == .spreading || sequence == .restoring }
+
+    mutating func begin(launcherPresented: Bool, desktopGestureEnabled: Bool) {
+        if !desktopGestureEnabled { pendingRestoreGeneration = nil }
+        if launcherPresented || !desktopGestureEnabled {
+            sequence = .inactive
+        } else {
+            sequence = awaitsRestore ? .restoring : .watchingForSpread
+        }
+    }
+
+    mutating func noteMotion(_ motion: CGFloat) {
+        if sequence == .watchingForSpread, motion <= -Self.deliberateMotion {
+            sequence = .spreading
+        }
+    }
+
+    /// An external exit frees the next contact. Keep yielding an existing
+    /// restoring contact until lift so it cannot switch owners mid-gesture.
+    @discardableResult
+    mutating func noteExternalExit(for expectedGeneration: UInt64? = nil) -> Bool {
+        guard let pendingRestoreGeneration,
+              expectedGeneration == nil || pendingRestoreGeneration == expectedGeneration
+        else { return false }
+        self.pendingRestoreGeneration = nil
+        return true
+    }
+
+    mutating func end(_ event: TrackpadContactState.TerminalEvent) {
+        defer { sequence = .inactive }
+        guard !event.claimed, event.outcome == .lifted || event.outcome == .topologyTimeout else { return }
+        switch sequence {
+        case .spreading where event.motion <= -Self.deliberateMotion:
+            pendingRestoreGeneration = event.generation
+        case .restoring where event.motion >= Self.deliberateMotion:
+            pendingRestoreGeneration = nil
+        default:
+            break
+        }
+    }
+}
+
 /// The callback thread publishes an entire sample under one lock. Readers
 /// never combine the position from one contact with another contact's state.
 nonisolated final class TrackpadContactState: @unchecked Sendable {

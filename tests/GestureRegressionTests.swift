@@ -534,6 +534,93 @@ struct GestureRegressionTests {
         }
     }
 
+    static func desktopSpreadReservesACompleteRestorePinch() throws {
+        func terminal(_ motion: CGFloat, outcome: TrackpadContactState.TerminalEvent.Outcome = .lifted,
+                      claimed: Bool = false) -> TrackpadContactState.TerminalEvent {
+            .init(outcome: outcome, generation: 1, candidateMotion: 0,
+                  peakMotion: motion, motion: motion, claimed: claimed)
+        }
+
+        var handoff = DesktopGestureHandoff()
+        handoff.begin(launcherPresented: false, desktopGestureEnabled: true)
+        handoff.noteMotion(-0.08)
+        try require(handoff.yields, "A deliberate desktop spread must stay with macOS")
+        handoff.end(terminal(-0.08, outcome: .topologyTimeout))
+        try require(handoff.awaitsRestore, "Completing the spread must reserve the restoring gesture")
+
+        handoff.begin(launcherPresented: false, desktopGestureEnabled: true)
+        try require(handoff.yields, "macOS must receive the whole restoring sequence")
+        handoff.end(terminal(0, outcome: .candidateAbort))
+        handoff.begin(launcherPresented: false, desktopGestureEnabled: true)
+        try require(handoff.yields, "A stray four-finger frame must not use up the restore")
+        handoff.end(terminal(0.015))
+        handoff.begin(launcherPresented: false, desktopGestureEnabled: true)
+        try require(handoff.yields, "A partial pinch must not use up the restore")
+        handoff.end(terminal(0.09, outcome: .qualityAbort))
+        handoff.begin(launcherPresented: false, desktopGestureEnabled: true)
+        try require(handoff.yields, "An aborted pinch must not use up the restore")
+
+        let contact = TrackpadContactState()
+        let start = ProcessInfo.processInfo.systemUptime
+        for index in 0..<7 {
+            let geometry = hand(radius: 0.24 - CGFloat(index) * 0.015)
+            try require(contact.noteQualifiedFrame(geometry, allowsClaim: !handoff.yields,
+                                                   at: start + Double(index) * 0.01) == nil,
+                        "A restoring pinch woke the launcher")
+        }
+        handoff.end(terminal(contact.snapshot(at: start + 0.06)!.motion))
+        handoff.begin(launcherPresented: false, desktopGestureEnabled: true)
+        try require(!handoff.yields && !handoff.awaitsRestore,
+                    "A completed restore must return the next pinch to the launcher")
+
+        handoff.begin(launcherPresented: true, desktopGestureEnabled: true)
+        handoff.noteMotion(-0.09)
+        handoff.end(terminal(-0.09, claimed: true))
+        try require(!handoff.awaitsRestore, "Closing LunchPad must not reserve a desktop restore")
+
+        handoff.begin(launcherPresented: false, desktopGestureEnabled: true)
+        handoff.noteMotion(-0.09)
+        handoff.end(terminal(-0.09))
+        handoff.begin(launcherPresented: false, desktopGestureEnabled: false)
+        try require(!handoff.yields && !handoff.awaitsRestore,
+                    "Disabling Show Desktop must clear the pending restore")
+    }
+
+    static func externalDesktopExitFreesTheNextPinch() throws {
+        for restoreAlreadyStarted in [false, true] {
+            var handoff = DesktopGestureHandoff()
+            handoff.begin(launcherPresented: false, desktopGestureEnabled: true)
+            handoff.noteMotion(-0.08)
+            handoff.end(.init(outcome: .lifted, generation: 2, candidateMotion: 0,
+                              peakMotion: -0.08, motion: -0.08, claimed: false))
+
+            try require(!handoff.noteExternalExit(for: 1) && handoff.awaitsRestore,
+                        "A delayed click from an older spread cleared the new restore")
+            if restoreAlreadyStarted {
+                handoff.begin(launcherPresented: false, desktopGestureEnabled: true)
+            }
+            try require(handoff.noteExternalExit(for: 2) && !handoff.awaitsRestore,
+                        "An observed external exit must clear the pending restore")
+            try require(handoff.yields == restoreAlreadyStarted,
+                        "An external exit must not change the owner of an ongoing restoring pinch")
+            if restoreAlreadyStarted {
+                handoff.end(.init(outcome: .lifted, generation: 3, candidateMotion: 0,
+                                  peakMotion: 0.01, motion: 0.01, claimed: false))
+            }
+
+            handoff.begin(launcherPresented: false, desktopGestureEnabled: true)
+            try require(!handoff.yields, "The first pinch after leaving the desktop must reach LunchPad")
+            let contact = TrackpadContactState()
+            let start = ProcessInfo.processInfo.systemUptime
+            for index in 0..<6 {
+                let geometry = hand(radius: 0.24 - CGFloat(index) * 0.015)
+                contact.noteQualifiedFrame(geometry, allowsClaim: !handoff.yields,
+                                           at: start + Double(index) * 0.01)
+            }
+            try require(contact.hasClaimedGesture, "LunchPad did not claim the first pinch after external exit")
+        }
+    }
+
     static func main() {
         let tests: [(String, () throws -> Void)] = [
             ("slow drags and stationary holds remain under finger control", slowHeldGestures),
@@ -554,7 +641,9 @@ struct GestureRegressionTests {
             ("split fingers cluster to a stable contact count", contactClusteringCollapsesSplitFingers),
             ("four-contact stability retains early travel and resets after a frame gap", stableBeginRejectsTransientFourFrames),
             ("only coherent directional motion can claim a four-finger gesture", directionalClaimRequiresCoherentMotion),
-            ("staggered lift releases and repeated topology loss cancels", staggeredLiftAndRepeatedTopologyLoss)
+            ("staggered lift releases and repeated topology loss cancels", staggeredLiftAndRepeatedTopologyLoss),
+            ("Show Desktop receives one complete restoring pinch", desktopSpreadReservesACompleteRestorePinch),
+            ("leaving Show Desktop externally frees the next pinch", externalDesktopExitFreesTheNextPinch)
         ]
         var failures = 0
         for (name, test) in tests {
