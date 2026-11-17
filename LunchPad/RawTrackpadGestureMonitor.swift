@@ -57,6 +57,10 @@ private nonisolated final class DesktopYieldGate: @unchecked Sendable {
 
     private let lock = NSLock()
     private var handoff = DesktopGestureHandoff()
+    private let probeQueue = DispatchQueue(label: "com.king.LunchPad.desktop-probe", qos: .userInitiated)
+    // Accessed only on probeQueue. An absent layer is meaningful once this
+    // Dock process has exposed the marker at least once.
+    private var dockPIDWithDesktopMarker: pid_t?
 
     func noteSpread(_ motion: CGFloat) -> Bool {
         lock.lock(); defer { lock.unlock() }
@@ -65,18 +69,63 @@ private nonisolated final class DesktopYieldGate: @unchecked Sendable {
         return !wasYielding && handoff.yields
     }
 
-    func beginSequence(launcherPresented: Bool) -> Bool {
+    func beginSequence(launcherPresented: Bool, at now: TimeInterval) {
         // The system setting defaults to enabled when Dock has no override.
         let dockPreferences = UserDefaults.standard.persistentDomain(forName: "com.apple.dock")
         let enabled = dockPreferences?["showDesktopGestureEnabled"] as? Bool ?? true
+        lock.lock()
+        if launcherPresented {
+            handoff.begin(launcherPresented: true, desktopGestureEnabled: enabled)
+            lock.unlock()
+            return
+        }
+        let ticket = handoff.beginWindowProbe(desktopGestureEnabled: enabled, at: now)
+        lock.unlock()
+
+        probeQueue.async { [self] in
+            lock.lock()
+            let stillNeeded = handoff.acceptsWindowState(for: ticket, at: ProcessInfo.processInfo.systemUptime)
+            lock.unlock()
+            guard stillNeeded else { return }
+            let state = readDockWindowState()
+            let sampledAt = ProcessInfo.processInfo.systemUptime
+            lock.lock(); defer { lock.unlock() }
+            handoff.recordWindowState(state, for: ticket, at: sampledAt)
+        }
+    }
+
+    private func readDockWindowState() -> DesktopGestureHandoff.WindowState {
+        guard let dockPID = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first?.processIdentifier,
+              let windows = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]],
+              !windows.isEmpty else { return .unknown }
+        // Dock PID is part of the signature. LunchPad's own main panel also
+        // uses layer 18.
+        let hasMarker = windows.contains {
+            ($0[kCGWindowOwnerPID as String] as? Int) == Int(dockPID)
+                && ($0[kCGWindowLayer as String] as? Int) == 18
+        }
+        if hasMarker {
+            dockPIDWithDesktopMarker = dockPID
+            return .active
+        }
+        return dockPIDWithDesktopMarker == dockPID ? .inactive : .unknown
+    }
+
+    func allowsLauncherClaim(at now: TimeInterval) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        handoff.begin(launcherPresented: launcherPresented, desktopGestureEnabled: enabled)
-        return handoff.yields
+        if let state = handoff.resolveWindowProbe(at: now) {
+            if handoff.yields { TrackpadSystemGestureGate.shared.clearSuppression() }
+            LauncherDiagnostics.shared.record(
+                "gesture-touch",
+                "desktop-probe state=\(state.rawValue) yields=\(handoff.yields ? 1 : 0)"
+            )
+        }
+        return !handoff.passesSystemEvents
     }
 
     var yields: Bool {
         lock.lock(); defer { lock.unlock() }
-        return handoff.yields
+        return handoff.passesSystemEvents
     }
 
     var pendingRestoreGeneration: UInt64? {
@@ -394,9 +443,7 @@ nonisolated private func lunchPadTrackpadContactCallback(
     case .ignore:
         break
     case .arm:
-        if desktopGate.beginSequence(launcherPresented: presented) {
-            gate.clearSuppression()
-        }
+        desktopGate.beginSequence(launcherPresented: presented, at: now)
     }
 
     guard qualified else {
@@ -411,7 +458,7 @@ nonisolated private func lunchPadTrackpadContactCallback(
     let generation = contact.noteQualifiedFrame(
         FourFingerGeometry(centers: centers),
         allowsSpread: presented,
-        allowsClaim: !desktopGate.yields,
+        allowsClaim: desktopGate.allowsLauncherClaim(at: now),
         at: now
     )
     if !presented, !contact.hasClaimedGesture,
@@ -571,7 +618,8 @@ final class RawTrackpadGestureMonitor {
         TrackpadContactState.shared.hasClaimedGesture && !DesktopYieldGate.shared.yields
     }
 
-    /// True while the current sequence defers to Show Desktop.
+    /// Keep system gesture events flowing while a lookup is pending or the
+    /// current contact has been handed to Show Desktop.
     nonisolated static var yieldsToDesktop: Bool {
         DesktopYieldGate.shared.yields
     }

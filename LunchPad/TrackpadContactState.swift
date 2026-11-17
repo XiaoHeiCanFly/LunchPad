@@ -1,24 +1,76 @@
 import Foundation
 
 /// Gives macOS the inverse gesture after a completed Show Desktop spread.
-/// Window enumeration doesn't expose the desktop gesture's presentation state.
+/// A live Dock-window observation takes priority over the gesture history.
 nonisolated struct DesktopGestureHandoff {
     static let deliberateMotion: CGFloat = 0.035
 
+    enum WindowState: String, Sendable {
+        case active, inactive, unknown
+    }
+
     private enum Sequence { case inactive, watchingForSpread, spreading, restoring }
+    private struct WindowProbe {
+        let ticket: UInt64
+        let deadline: TimeInterval
+        let desktopGestureEnabled: Bool
+        var result: WindowState?
+    }
+
     private var sequence = Sequence.inactive
+    private var windowProbe: WindowProbe?
+    private var nextProbeTicket: UInt64 = 0
     private(set) var pendingRestoreGeneration: UInt64?
 
     var awaitsRestore: Bool { pendingRestoreGeneration != nil }
     var yields: Bool { sequence == .spreading || sequence == .restoring }
+    var passesSystemEvents: Bool { windowProbe != nil || yields }
 
-    mutating func begin(launcherPresented: Bool, desktopGestureEnabled: Bool) {
-        if !desktopGestureEnabled { pendingRestoreGeneration = nil }
-        if launcherPresented || !desktopGestureEnabled {
+    mutating func begin(
+        launcherPresented: Bool,
+        desktopGestureEnabled: Bool,
+        windowState: WindowState = .unknown
+    ) {
+        windowProbe = nil
+        if !desktopGestureEnabled || windowState == .inactive { pendingRestoreGeneration = nil }
+        if launcherPresented {
             sequence = .inactive
-        } else {
+        } else if windowState == .active {
+            sequence = .restoring
+        } else if desktopGestureEnabled {
             sequence = awaitsRestore ? .restoring : .watchingForSpread
+        } else {
+            sequence = .inactive
         }
+    }
+
+    mutating func beginWindowProbe(desktopGestureEnabled: Bool, at now: TimeInterval) -> UInt64 {
+        nextProbeTicket &+= 1
+        sequence = .inactive
+        windowProbe = WindowProbe(ticket: nextProbeTicket,
+                                  deadline: now + TrackpadContactState.stableBeginDuration,
+                                  desktopGestureEnabled: desktopGestureEnabled)
+        return nextProbeTicket
+    }
+
+    func acceptsWindowState(for ticket: UInt64, at now: TimeInterval) -> Bool {
+        guard let probe = windowProbe else { return false }
+        return probe.ticket == ticket && now <= probe.deadline && probe.result == nil
+    }
+
+    mutating func recordWindowState(_ state: WindowState, for ticket: UInt64, at now: TimeInterval) {
+        guard acceptsWindowState(for: ticket, at: now) else { return }
+        windowProbe?.result = state
+    }
+
+    /// Called before the store can claim a coherent pinch. The lookup runs
+    /// during the same window as the four-contact stability check.
+    mutating func resolveWindowProbe(at now: TimeInterval) -> WindowState? {
+        guard let probe = windowProbe else { return nil }
+        if probe.result == nil, now < probe.deadline { return nil }
+        let state = probe.result ?? .unknown
+        begin(launcherPresented: false, desktopGestureEnabled: probe.desktopGestureEnabled, windowState: state)
+        return state
     }
 
     mutating func noteMotion(_ motion: CGFloat) {
@@ -35,11 +87,17 @@ nonisolated struct DesktopGestureHandoff {
               expectedGeneration == nil || pendingRestoreGeneration == expectedGeneration
         else { return false }
         self.pendingRestoreGeneration = nil
+        // A lookup started before Escape or an app activation may still show
+        // the old desktop. The exit event is newer than that lookup.
+        windowProbe?.result = .unknown
         return true
     }
 
     mutating func end(_ event: TrackpadContactState.TerminalEvent) {
-        defer { sequence = .inactive }
+        defer {
+            sequence = .inactive
+            windowProbe = nil
+        }
         guard !event.claimed, event.outcome == .lifted || event.outcome == .topologyTimeout else { return }
         switch sequence {
         case .spreading where event.motion <= -Self.deliberateMotion:

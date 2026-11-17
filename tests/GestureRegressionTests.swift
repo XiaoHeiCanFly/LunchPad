@@ -621,6 +621,76 @@ struct GestureRegressionTests {
         }
     }
 
+    static func liveDesktopObservationTakesPriorityAndKeepsEarlyMotion() throws {
+        let spread = TrackpadContactState.TerminalEvent(
+            outcome: .lifted, generation: 1, candidateMotion: 0,
+            peakMotion: -0.08, motion: -0.08, claimed: false
+        )
+        let start = ProcessInfo.processInfo.systemUptime
+        for state in [DesktopGestureHandoff.WindowState.active, .inactive] {
+            var handoff = DesktopGestureHandoff()
+            if state == .inactive {
+                handoff.begin(launcherPresented: false, desktopGestureEnabled: true)
+                handoff.noteMotion(spread.motion)
+                handoff.end(spread)
+                try require(handoff.awaitsRestore, "The test requires a stale restore reservation")
+            }
+
+            let contact = TrackpadContactState()
+            let ticket = handoff.beginWindowProbe(desktopGestureEnabled: true, at: start)
+            for index in 0..<3 {
+                let now = start + Double(index) * 0.008
+                try require(handoff.resolveWindowProbe(at: now) == nil && handoff.passesSystemEvents,
+                            "A pending observation must keep system events flowing")
+                let geometry = hand(radius: 0.24 - CGFloat(index) * 0.02)
+                try require(contact.noteQualifiedFrame(geometry, allowsClaim: !handoff.passesSystemEvents,
+                                                       at: now) == nil,
+                            "The launcher must not claim while the observation is pending")
+            }
+            handoff.recordWindowState(state, for: ticket, at: start + 0.020)
+            try require(handoff.resolveWindowProbe(at: start + 0.032) == state,
+                        "The sequence did not adopt its live observation")
+            let generation = contact.noteQualifiedFrame(hand(radius: 0.20),
+                                                        allowsClaim: !handoff.passesSystemEvents,
+                                                        at: start + 0.032)
+            if state == .active {
+                try require(generation == nil && handoff.yields,
+                            "An active desktop must receive the pinch even without a remembered spread")
+                handoff.recordWindowState(.inactive, for: ticket, at: start + 0.033)
+                try require(handoff.passesSystemEvents, "A late change took ownership mid-pinch")
+            } else {
+                try require(generation != nil && !handoff.awaitsRestore,
+                            "An inactive desktop must clear stale history and allow the first pinch")
+                try near(contact.snapshot(for: generation, at: start + 0.032)!.motion,
+                         0.04, "The probe erased movement collected during confirmation")
+            }
+        }
+    }
+
+    static func desktopProbeTimeoutAndSequenceIsolation() throws {
+        var handoff = DesktopGestureHandoff()
+        handoff.begin(launcherPresented: false, desktopGestureEnabled: true)
+        handoff.noteMotion(-0.08)
+        handoff.end(.init(outcome: .lifted, generation: 8, candidateMotion: 0,
+                          peakMotion: -0.08, motion: -0.08, claimed: false))
+
+        let expired = handoff.beginWindowProbe(desktopGestureEnabled: true, at: 100)
+        handoff.recordWindowState(.inactive, for: expired, at: 100.04)
+        try require(handoff.resolveWindowProbe(at: 100.04) == .unknown && handoff.yields,
+                    "A late probe must fall back to the remembered spread")
+        handoff.end(.init(outcome: .candidateAbort, generation: 0, candidateMotion: 0,
+                          peakMotion: 0, motion: 0, claimed: false))
+
+        let current = handoff.beginWindowProbe(desktopGestureEnabled: true, at: 101)
+        handoff.recordWindowState(.inactive, for: expired, at: 101.01)
+        try require(handoff.resolveWindowProbe(at: 101.01) == nil,
+                    "A result from a previous contact affected a new contact")
+        handoff.recordWindowState(.active, for: current, at: 101.02)
+        try require(handoff.noteExternalExit(for: 8), "The external exit did not clear the reservation")
+        try require(handoff.resolveWindowProbe(at: 101.025) == .unknown && !handoff.passesSystemEvents,
+                    "An observation predating the external exit overrode it")
+    }
+
     static func main() {
         let tests: [(String, () throws -> Void)] = [
             ("slow drags and stationary holds remain under finger control", slowHeldGestures),
@@ -643,7 +713,9 @@ struct GestureRegressionTests {
             ("only coherent directional motion can claim a four-finger gesture", directionalClaimRequiresCoherentMotion),
             ("staggered lift releases and repeated topology loss cancels", staggeredLiftAndRepeatedTopologyLoss),
             ("Show Desktop receives one complete restoring pinch", desktopSpreadReservesACompleteRestorePinch),
-            ("leaving Show Desktop externally frees the next pinch", externalDesktopExitFreesTheNextPinch)
+            ("leaving Show Desktop externally frees the next pinch", externalDesktopExitFreesTheNextPinch),
+            ("live desktop state takes priority and preserves early pinch motion", liveDesktopObservationTakesPriorityAndKeepsEarlyMotion),
+            ("desktop probes time out without leaking across contact sequences", desktopProbeTimeoutAndSequenceIsolation)
         ]
         var failures = 0
         for (name, test) in tests {
