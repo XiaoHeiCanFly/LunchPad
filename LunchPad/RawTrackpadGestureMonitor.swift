@@ -170,17 +170,7 @@ nonisolated final class GestureTouchDiagnostics: @unchecked Sendable {
     enum FrameAction {
         case ignore
         case arm
-        case qualityReject
     }
-
-    /// A sequence stays believable only while nearly every frame keeps its
-    /// four distinct contacts. Observed distributions: genuine pinches hold
-    /// 97–99.6% qualified frames; palm-interloper sequences sit at 69–82% with
-    /// the dips interleaved from early on. 12% sits in the empty gap between
-    /// the two clusters, and 12 frames (~0.1s) lets the guard trip well before
-    /// a swipe can build commit-level motion.
-    private static let qualityMinimumFrames = 12
-    private static let qualityMaximumDipRatio = 0.12
 
     /// Records one processed frame. Counters only arm once a qualifying
     /// (four-cluster) frame appears, so ordinary one-finger use never accumulates.
@@ -209,7 +199,7 @@ nonisolated final class GestureTouchDiagnostics: @unchecked Sendable {
             guard qualified else { return .ignore }
             armedSince = now
             armLag = episodeStart.map { now - $0 } ?? -1
-            initialPairs = Self.sortedPairDistances(centers)
+            initialPairs = FourFingerGeometry.sortedPairDistances(centers)
             latestCenters = centers
             latestRecords = records
             frames += 1
@@ -227,12 +217,8 @@ nonisolated final class GestureTouchDiagnostics: @unchecked Sendable {
             qualifiedFrames += 1
             if centers.count == 4 { latestCenters = centers }
             if !records.isEmpty { latestRecords = records }
-        } else {
-            if firstDipFrame == nil { firstDipFrame = frames }
-            let dipRatio = 1.0 - Double(qualifiedFrames) / Double(max(frames, 1))
-            if frames >= Self.qualityMinimumFrames, dipRatio > Self.qualityMaximumDipRatio {
-                return .qualityReject
-            }
+        } else if firstDipFrame == nil {
+            firstDipFrame = frames
         }
         rawHistogram[raw, default: 0] += 1
         clusterHistogram[clusters, default: 0] += 1
@@ -263,6 +249,9 @@ nonisolated final class GestureTouchDiagnostics: @unchecked Sendable {
             + " gen=\(event.generation)"
             + " dur=\(fixed(now - since))"
             + " motion=\(fixed(event.motion))"
+            + " candidate-motion=\(fixed(event.candidateMotion))"
+            + " peak-motion=\(fixed(event.peakMotion))"
+            + " claimed=\(event.claimed ? 1 : 0)"
             + " frames=\(frames) qualified=\(qualifiedFrames)"
             + String(format: " qr=%.2f", qualifiedRatio)
             + " dip@=\(firstDipFrame.map(String.init) ?? "-")"
@@ -271,7 +260,7 @@ nonisolated final class GestureTouchDiagnostics: @unchecked Sendable {
             + " other-drops=\(otherDeviceDrops)"
         line += String(format: " armLag=%.3f", armLag ?? -1)
         if initialPairs.count == 6, latestCenters.count == 4 {
-            let latest = Self.sortedPairDistances(latestCenters)
+            let latest = FourFingerGeometry.sortedPairDistances(latestCenters)
             if latest.count == 6 {
                 let deltas = zip(latest, initialPairs)
                     .map { String(format: "%.3f", $0 - $1) }
@@ -298,22 +287,6 @@ nonisolated final class GestureTouchDiagnostics: @unchecked Sendable {
         latestRecords = []
         firstDipFrame = nil
         LauncherDiagnostics.shared.record("gesture-touch", line)
-    }
-
-    /// Sorted pairwise distances of a four-contact set: the first three are
-    /// the intra-group gaps, the last three the spread-out pairs.
-    private static func sortedPairDistances(_ centers: [CGPoint]) -> [CGFloat] {
-        guard centers.count == 4 else { return [] }
-        var distances: [CGFloat] = []
-        for index in 0..<4 {
-            for other in (index + 1)..<4 {
-                distances.append(hypot(
-                    centers[index].x - centers[other].x,
-                    centers[index].y - centers[other].y
-                ))
-            }
-        }
-        return distances.sorted()
     }
 
     /// Rate-limited: a broken contact layout would otherwise log every frame.
@@ -361,6 +334,9 @@ nonisolated private func lunchPadTrackpadContactCallback(
 ) {
     let now = ProcessInfo.processInfo.systemUptime
     let gate = TrackpadSystemGestureGate.shared
+    let desktopGate = DesktopYieldGate.shared
+    let presented = LauncherController.isPresentedOnScreen
+    let contact = TrackpadContactState.shared
 
     // A second trackpad's frames must not interleave with the device that
     // owns the in-flight contact or candidate.
@@ -374,7 +350,7 @@ nonisolated private func lunchPadTrackpadContactCallback(
         GestureTouchDiagnostics.shared.noteFrame(
             raw: rawCount, clusters: 0, qualified: false, centers: []
         )
-        TrackpadContactState.shared.endContact(contactCount: 0, at: now)
+        contact.endContact(contactCount: 0, at: now)
         ContactDeviceOwnership.shared.releaseIfIdle()
         return
     }
@@ -390,9 +366,8 @@ nonisolated private func lunchPadTrackpadContactCallback(
         guard x.isFinite, y.isFinite,
               x >= -0.15, x <= 1.15, y >= -0.15, y <= 1.15 else {
             GestureTouchDiagnostics.shared.noteCoordViolation(x: x, y: y, index: index)
-            if rawCount >= 4, TrackpadContactState.shared.hasClaimedPinch {
-                gate.suppress(for: 0.6)
-            }
+            contact.endContact(contactCount: rawCount, at: now)
+            ContactDeviceOwnership.shared.releaseIfIdle()
             return
         }
         points.append(CGPoint(x: x, y: y))
@@ -424,23 +399,15 @@ nonisolated private func lunchPadTrackpadContactCallback(
     case .arm:
         // Arming dump already emitted inside noteFrame (budgeted); decide
         // now whether this sequence yields to Show Desktop.
-        DesktopYieldGate.shared.evaluateSequenceStart()
-    case .qualityReject:
-        // Too many frames lost their four distinct contacts — a palm-style
-        // interloper sequence, not a pinch. Kill it before motion can commit.
-        TrackpadContactState.shared.rejectContact(at: now)
-        ContactDeviceOwnership.shared.releaseIfIdle()
-        return
+        if presented {
+            desktopGate.endSequence()
+        } else {
+            desktopGate.evaluateSequenceStart()
+        }
     }
 
     guard qualified else {
-        // Four or more *distinct* fingers still matter for the attempt (they
-        // arm the candidate), but system events are only held back once the
-        // pinch claim threshold is crossed — a spread must stay the system's.
-        if centers.count >= 4, TrackpadContactState.shared.hasClaimedPinch {
-            gate.suppress(for: 0.6)
-        }
-        TrackpadContactState.shared.endContact(contactCount: centers.count, at: now)
+        contact.endContact(contactCount: centers.count, at: now)
         ContactDeviceOwnership.shared.releaseIfIdle()
         return
     }
@@ -448,27 +415,20 @@ nonisolated private func lunchPadTrackpadContactCallback(
     if let device { ContactDeviceOwnership.shared.claim(device) }
     gate.pendingBeginGesture = false
 
-    var cx: CGFloat = 0, cy: CGFloat = 0
-    for center in centers {
-        cx += center.x; cy += center.y
+    let generation = contact.noteQualifiedFrame(
+        FourFingerGeometry(centers: centers),
+        allowsSpread: presented,
+        allowsClaim: !desktopGate.yields,
+        at: now
+    )
+    if !presented, !contact.hasClaimedGesture,
+       let sample = contact.snapshot(at: now), sample.contactActive,
+       sample.motion <= -DesktopYieldGate.spreadMotion {
+        desktopGate.noteDeliberateSpread()
     }
-    cx /= 4; cy /= 4
-
-    var radius: CGFloat = 0
-    for center in centers {
-        radius += hypot(center.x - cx, center.y - cy)
-    }
-    radius /= 4
-
-    // Wake the main-thread animator once per contact sequence. This is a
-    // single hop per gesture — never per frame. The generation prevents a
-    // delayed wakeup from attaching itself to a later set of fingers.
-    if let snap = TrackpadContactState.shared.snapshot(),
-       snap.motion <= -DesktopYieldGate.spreadMotion {
-        DesktopYieldGate.shared.noteDeliberateSpread()
-    }
-    if let generation = TrackpadContactState.shared.noteQualifiedFrame(radius: radius, at: now),
-       !DesktopYieldGate.shared.yields {
+    // One hop when this contact claims the gesture, including any motion
+    // measured while the four contacts were still being confirmed.
+    if let generation {
         DispatchQueue.main.async {
             MainActor.assumeIsolated {
                 LauncherController.shared.rawTrackpadGestureBegan(generation: generation)
@@ -478,7 +438,7 @@ nonisolated private func lunchPadTrackpadContactCallback(
     // Hold system gestures back only once this contact's motion is
     // unambiguously a pinch — evaluated after the frame that may have
     // crossed the threshold. While yielding, the system keeps everything.
-    if TrackpadContactState.shared.hasClaimedPinch, !DesktopYieldGate.shared.yields {
+    if contact.hasClaimedGesture, !desktopGate.yields {
         gate.suppress(for: 0.6)
     }
     ContactDeviceOwnership.shared.releaseIfIdle()
@@ -599,12 +559,9 @@ final class RawTrackpadGestureMonitor {
         TrackpadSystemGestureGate.shared.hasFourFingerContact
     }
 
-    /// The live contact crossed the animator's begin threshold in the pinch
-    /// direction; only now may the tap swallow system gesture events. While a
-    /// sequence yields to Show Desktop, never — the system's exit pinch has
-    /// priority.
-    nonisolated static var hasClaimedPinch: Bool {
-        TrackpadContactState.shared.hasClaimedPinch && !DesktopYieldGate.shared.yields
+    /// This contact belongs to LunchPad until it ends, including reversals.
+    nonisolated static var hasClaimedGesture: Bool {
+        TrackpadContactState.shared.hasClaimedGesture && !DesktopYieldGate.shared.yields
     }
 
     /// True while the current sequence defers to Show Desktop.

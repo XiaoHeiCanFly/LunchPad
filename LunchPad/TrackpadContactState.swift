@@ -7,6 +7,7 @@ nonisolated final class TrackpadContactState: @unchecked Sendable {
         let generation: UInt64
         let motion: CGFloat
         let contactActive: Bool
+        let cancelled: Bool
         /// Uptime of the last valid radius measurement. Release preserves it
         /// so a lift cannot masquerade as another motion sample.
         let timestamp: TimeInterval
@@ -14,12 +15,12 @@ nonisolated final class TrackpadContactState: @unchecked Sendable {
 
     static let shared = TrackpadContactState()
     static let contactLossGrace: TimeInterval = 0.12
-    /// Net pinch motion (radius units) at which the four-finger gesture is
-    /// unambiguously ours. Mirrors the animator's begin threshold
-    /// (`rawSensitivity 0.095 × 0.02`): below it the contact has claimed
-    /// nothing, so the CGEvent tap must keep passing system gesture events —
-    /// a four-finger spread (negative motion) never crosses this line.
+    /// Minimum net travel in raw radius units, matching the animator's 2%
+    /// presentation threshold. Pair distances must also agree with the motion.
     static let claimMotion: CGFloat = 0.0019
+    private static let minimumRadiusStep: CGFloat = 0.00025
+    private static let qualityMinimumFrames = 12
+    private static let qualityMaximumDipRatio = 0.12
 
     /// One line of contact-lifecycle telemetry. `candidateAbort` carries
     /// generation 0: no contact ever began.
@@ -33,7 +34,10 @@ nonisolated final class TrackpadContactState: @unchecked Sendable {
         }
         let outcome: Outcome
         let generation: UInt64
+        let candidateMotion: CGFloat
+        let peakMotion: CGFloat
         let motion: CGFloat
+        let claimed: Bool
     }
     /// A gesture only begins after this much uninterrupted four-contact time,
     /// so a single stray frame (finger split, palm edge) cannot hijack a
@@ -49,10 +53,20 @@ nonisolated final class TrackpadContactState: @unchecked Sendable {
     private var accumulatedMotion: CGFloat = 0
     private var contactIsActive = false
     private var contactIsCancelled = false
+    private var gestureClaimed = false
     private var lastSampleUptime: TimeInterval = 0
     private var contactLossBeganAt: TimeInterval?
+    private var candidateStartedAt: TimeInterval?
     private var candidateLastQualifiedAt: TimeInterval?
-    private var candidateQualifiedDuration: TimeInterval = 0
+    private var baseline: FourFingerGeometry?
+    private var directionStepRadius: CGFloat = 0
+    private var pinchSteps = 0
+    private var spreadSteps = 0
+    private var candidateMotion: CGFloat = 0
+    private var peakMotion: CGFloat = 0
+    private var validFrames = 0
+    private var invalidFrames = 0
+    private var recoveredLosses = 0
     private var completedContacts: [UInt64: Snapshot] = [:]
     private var completedGenerations: [UInt64] = []
     /// Invoked under the state lock, once per terminal transition — keep the
@@ -85,15 +99,15 @@ nonisolated final class TrackpadContactState: @unchecked Sendable {
     /// state machine; the device-ownership gate must not release in between.
     var hasPendingState: Bool {
         lock.lock(); defer { lock.unlock() }
+        expireContactIfNeededLocked(now: ProcessInfo.processInfo.systemUptime)
         return contactIsActive || candidateLastQualifiedAt != nil
     }
 
-    /// True while the live contact's net motion is in the pinch direction and
-    /// past the animator's begin threshold — the system's gesture events may
-    /// be swallowed from this point on, never before.
-    var hasClaimedPinch: Bool {
+    /// Once claimed, the same live contact owns the gesture through reversals.
+    var hasClaimedGesture: Bool {
         lock.lock(); defer { lock.unlock() }
-        return contactIsActive && accumulatedMotion >= Self.claimMotion
+        expireContactIfNeededLocked(now: ProcessInfo.processInfo.systemUptime)
+        return contactIsActive && gestureClaimed
     }
 
     /// Set once before any device frames arrive (monitor `start()`).
@@ -118,35 +132,88 @@ nonisolated final class TrackpadContactState: @unchecked Sendable {
         return noteActiveFrameLocked(radius: radius, at: now)
     }
 
-    /// The raw-trackpad callback's entry point for frames whose contact set
-    /// qualifies as four fingers. The first `stableBeginDuration` of such
-    /// frames only arms a candidate; any non-qualifying frame disarms it, so
-    /// one stray four-count frame never begins a gesture.
+    /// Accumulate travel from the first stable geometry. Return the generation
+    /// once, when a coherent direction has earned a claim.
     @discardableResult
     func noteQualifiedFrame(
-        radius: CGFloat,
+        _ geometry: FourFingerGeometry,
+        allowsSpread: Bool = false,
+        allowsClaim: Bool = true,
         at now: TimeInterval = ProcessInfo.processInfo.systemUptime
     ) -> UInt64? {
+        let radius = geometry.radius
         guard radius.isFinite, radius >= 0, now.isFinite else { return nil }
         lock.lock(); defer { lock.unlock() }
         expireContactIfNeededLocked(now: now)
         if contactIsActive {
-            return noteActiveFrameLocked(radius: radius, at: now)
+            validFrames += 1
+            if contactLossBeganAt != nil {
+                recoveredLosses += 1
+                let totalFrames = validFrames + invalidFrames
+                // A trailing run of lost contacts is a lift. Evaluate quality
+                // only after repeated gaps that actually recover to four.
+                if recoveredLosses >= 2, totalFrames >= Self.qualityMinimumFrames,
+                   Double(invalidFrames) / Double(totalFrames) > Self.qualityMaximumDipRatio {
+                    contactIsCancelled = true
+                    finishContactLocked(outcome: .qualityAbort)
+                    return nil
+                }
+                if !gestureClaimed {
+                    resetDirectionLocked(to: geometry)
+                    accumulatedMotion = 0
+                }
+            } else if !gestureClaimed {
+                recordDirectionStepLocked(to: radius)
+            }
+            noteActiveFrameLocked(radius: radius, at: now)
+        } else {
+            if let last = candidateLastQualifiedAt,
+               now >= last, now - last <= Self.qualifiedFrameGap {
+                recordDirectionStepLocked(to: radius)
+                validFrames += 1
+            } else {
+                candidateStartedAt = now
+                resetDirectionLocked(to: geometry)
+                validFrames = 1
+            }
+            latestRadius = radius
+            candidateLastQualifiedAt = now
+            guard let start = candidateStartedAt, now - start >= Self.stableBeginDuration,
+                  let baseline else { return nil }
+            let frames = validFrames
+            _ = beginContactLocked(radius: radius, at: now, initialMotion: baseline.radius - radius)
+            validFrames = frames
         }
-        if let last = candidateLastQualifiedAt, now - last <= Self.qualifiedFrameGap {
-            candidateQualifiedDuration += min(now - last, 0.05)
-        } else if candidateLastQualifiedAt != nil {
-            candidateQualifiedDuration = 0
-        }
-        candidateLastQualifiedAt = now
-        guard candidateQualifiedDuration >= Self.stableBeginDuration else { return nil }
-        return beginContactLocked(radius: radius, at: now)
+        guard allowsClaim, !gestureClaimed, let baseline else { return nil }
+        let direction: CGFloat = accumulatedMotion < 0 ? -1 : 1
+        let steps = direction > 0 ? pinchSteps : spreadSteps
+        guard direction > 0 || allowsSpread,
+              abs(accumulatedMotion) >= Self.claimMotion, steps >= 2,
+              geometry.supportsMotion(from: baseline, direction: direction) else { return nil }
+        gestureClaimed = true
+        return generation
     }
 
+    private func resetDirectionLocked(to geometry: FourFingerGeometry) {
+        baseline = geometry
+        directionStepRadius = geometry.radius
+        pinchSteps = 0
+        spreadSteps = 0
+    }
+
+    private func recordDirectionStepLocked(to radius: CGFloat) {
+        let step = directionStepRadius - radius
+        guard abs(step) >= Self.minimumRadiusStep else { return }
+        if step > 0 { pinchSteps += 1 } else { spreadSteps += 1 }
+        directionStepRadius = radius
+    }
+
+    @discardableResult
     private func noteActiveFrameLocked(radius: CGFloat, at now: TimeInterval) -> UInt64? {
         if contactLossBeganAt == nil {
             // Positive motion is a pinch; negative motion is a spread.
             accumulatedMotion += latestRadius - radius
+            if abs(accumulatedMotion) > abs(peakMotion) { peakMotion = accumulatedMotion }
         }
         // On recovery from a short 3/5-finger frame, the four-contact centroid
         // may have changed. Rebase without introducing a progress jump.
@@ -156,18 +223,24 @@ nonisolated final class TrackpadContactState: @unchecked Sendable {
         return nil
     }
 
-    private func beginContactLocked(radius: CGFloat, at now: TimeInterval) -> UInt64 {
+    private func beginContactLocked(radius: CGFloat, at now: TimeInterval, initialMotion: CGFloat = 0) -> UInt64 {
         generation &+= 1
         // Zero denotes the absence of any contact.
         if generation == 0 { generation = 1 }
-        accumulatedMotion = 0
+        accumulatedMotion = initialMotion
+        candidateMotion = initialMotion
+        peakMotion = initialMotion
         latestRadius = radius
         contactIsActive = true
         contactIsCancelled = false
+        gestureClaimed = false
         contactLossBeganAt = nil
         lastSampleUptime = now
+        candidateStartedAt = nil
         candidateLastQualifiedAt = nil
-        candidateQualifiedDuration = 0
+        validFrames = 0
+        invalidFrames = 0
+        recoveredLosses = 0
         return generation
     }
 
@@ -180,9 +253,7 @@ nonisolated final class TrackpadContactState: @unchecked Sendable {
         guard contactIsActive else {
             // Any non-qualifying frame disarms an unstarted candidate.
             if candidateLastQualifiedAt != nil {
-                candidateLastQualifiedAt = nil
-                candidateQualifiedDuration = 0
-                emitTerminalLocked(TerminalEvent(outcome: .candidateAbort, generation: 0, motion: 0))
+                finishCandidateLocked(outcome: .candidateAbort)
             }
             return
         }
@@ -192,6 +263,7 @@ nonisolated final class TrackpadContactState: @unchecked Sendable {
         }
         // Grace starts at an observed topology change, never at the last
         // position update. A stationary hand may stop producing callbacks.
+        invalidFrames += 1
         if contactLossBeganAt == nil { contactLossBeganAt = now }
         expireContactIfNeededLocked(now: now)
     }
@@ -203,28 +275,21 @@ nonisolated final class TrackpadContactState: @unchecked Sendable {
         guard now.isFinite else { return }
         lock.lock(); defer { lock.unlock() }
         contactIsCancelled = true
-        candidateLastQualifiedAt = nil
-        candidateQualifiedDuration = 0
-        if contactIsActive { finishContactLocked(outcome: .cancelled) }
+        if contactIsActive {
+            finishContactLocked(outcome: .cancelled)
+        } else if candidateLastQualifiedAt != nil {
+            finishCandidateLocked(outcome: .cancelled)
+        }
     }
 
-    /// The quality gate rejected the contact topology (too many frames lost
-    /// their four distinct contacts). Disarms a candidate or finishes an
-    /// active contact, and marks the state cancelled so a queued begin cannot
-    /// revive this sequence.
-    func rejectContact(at now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
-        guard now.isFinite else { return }
-        lock.lock(); defer { lock.unlock() }
-        contactIsCancelled = true
-        if contactIsActive {
-            finishContactLocked(outcome: .qualityAbort)
-            return
-        }
-        if candidateLastQualifiedAt != nil {
-            candidateLastQualifiedAt = nil
-            candidateQualifiedDuration = 0
-            emitTerminalLocked(TerminalEvent(outcome: .qualityAbort, generation: 0, motion: 0))
-        }
+    private func finishCandidateLocked(outcome: TerminalEvent.Outcome) {
+        let motion = (baseline?.radius ?? latestRadius) - latestRadius
+        candidateStartedAt = nil
+        candidateLastQualifiedAt = nil
+        emitTerminalLocked(TerminalEvent(
+            outcome: outcome, generation: 0, candidateMotion: motion,
+            peakMotion: motion, motion: motion, claimed: false
+        ))
     }
 
     private func expireContactIfNeededLocked(now: TimeInterval) {
@@ -242,7 +307,10 @@ nonisolated final class TrackpadContactState: @unchecked Sendable {
         if completedGenerations.count > Self.retainedContactCount {
             completedContacts.removeValue(forKey: completedGenerations.removeFirst())
         }
-        emitTerminalLocked(TerminalEvent(outcome: outcome, generation: generation, motion: accumulatedMotion))
+        emitTerminalLocked(TerminalEvent(
+            outcome: outcome, generation: generation, candidateMotion: candidateMotion,
+            peakMotion: peakMotion, motion: accumulatedMotion, claimed: gestureClaimed
+        ))
     }
 
     private func emitTerminalLocked(_ event: TerminalEvent) {
@@ -254,8 +322,50 @@ nonisolated final class TrackpadContactState: @unchecked Sendable {
             generation: generation,
             motion: accumulatedMotion,
             contactActive: contactIsActive,
+            cancelled: contactIsCancelled,
             timestamp: lastSampleUptime
         )
+    }
+}
+
+/// The pair distances describe hand shape independently of translation,
+/// rotation, and the order in which the trackpad reports the four contacts.
+nonisolated struct FourFingerGeometry {
+    let radius: CGFloat
+    let pairDistances: [CGFloat]
+
+    init(centers: [CGPoint]) {
+        let count = CGFloat(centers.count)
+        let x = centers.reduce(0) { $0 + $1.x } / count
+        let y = centers.reduce(0) { $0 + $1.y } / count
+        radius = centers.reduce(0) { $0 + hypot($1.x - x, $1.y - y) } / count
+        pairDistances = Self.sortedPairDistances(centers)
+    }
+
+    func supportsMotion(from baseline: Self, direction: CGFloat) -> Bool {
+        var supportingPairs = 0
+        var supportingTravel: CGFloat = 0
+        var opposingTravel: CGFloat = 0
+        for (current, start) in zip(pairDistances, baseline.pairDistances) {
+            let travel = (start - current) * direction
+            if travel >= 0.003 { supportingPairs += 1 }
+            supportingTravel += max(0, travel)
+            opposingTravel += max(0, -travel)
+        }
+        // A thumb moving toward three stable fingers can contribute three
+        // pairs. A lateral slip tends to shorten some and lengthen others.
+        return supportingPairs >= 3 && supportingTravel >= 2 * opposingTravel
+    }
+
+    static func sortedPairDistances(_ centers: [CGPoint]) -> [CGFloat] {
+        var distances: [CGFloat] = []
+        for index in centers.indices {
+            for other in (index + 1)..<centers.count {
+                distances.append(hypot(centers[index].x - centers[other].x,
+                                       centers[index].y - centers[other].y))
+            }
+        }
+        return distances.sorted()
     }
 }
 

@@ -81,6 +81,7 @@ final class LauncherGestureAnimator {
         var target: CGFloat
         var timestamp: TimeInterval
         var contactActive: Bool = true
+        var cancelled: Bool = false
     }
 
     private var trackingTargetProvider: (() -> TrackingSample)?
@@ -169,7 +170,9 @@ final class LauncherGestureAnimator {
     func endTracking(cancelled: Bool = false, at now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
         guard state == .tracking else { return }
         let generation = transitionGeneration
-        if let sample = trackingTargetProvider?() { record(sample) }
+        let sample = trackingTargetProvider?()
+        let cancelled = cancelled || sample?.cancelled == true
+        if !cancelled, let sample { record(sample) }
         guard state == .tracking, transitionGeneration == generation else { return }
         let releaseVelocity = currentFingerVelocity(at: now)
         let projected = latestTarget + min(Self.maximumProjection, max(-Self.maximumProjection,
@@ -284,6 +287,10 @@ final class LauncherGestureAnimator {
             let generation = transitionGeneration
             guard let sample = trackingTargetProvider?() else {
                 endTracking(at: now)
+                return
+            }
+            if sample.cancelled {
+                endTracking(cancelled: true, at: now)
                 return
             }
             record(sample)

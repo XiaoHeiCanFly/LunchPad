@@ -81,8 +81,8 @@ final class LauncherController: ObservableObject {
     private var lastDiagnosticsProgressBucket = -1
 
     // Thread-safe flag for the CGEvent tap (runs on a background thread).
-    private let _isPresentedOnScreen = AtomicBool()
-    nonisolated var isPresentedOnScreen: Bool { _isPresentedOnScreen.value }
+    private nonisolated static let presentationFlag = AtomicBool()
+    nonisolated static var isPresentedOnScreen: Bool { presentationFlag.value }
 
     /// 拖拽指针约束（见 DragConstraintBox）：拖拽期间指针不允许
     /// 离开启动台所在显示器。
@@ -94,7 +94,7 @@ final class LauncherController: ObservableObject {
 
     private func setPresented(_ value: Bool) {
         isPresented = value
-        _isPresentedOnScreen.set(value)
+        Self.presentationFlag.set(value)
     }
 
     private init() {
@@ -173,7 +173,7 @@ final class LauncherController: ObservableObject {
         store.stopObservingApplicationChanges()
         store.stopObservingAppStoreDownloads()
         animator.stop()
-        _isPresentedOnScreen.set(false)
+        Self.presentationFlag.set(false)
         isPresented = false
         isPinching = false
         if let tap = systemEventTap {
@@ -552,7 +552,8 @@ final class LauncherController: ObservableObject {
             return LauncherGestureAnimator.TrackingSample(
                 target: base + (sample?.motion ?? initial.motion) / LauncherGestureAnimator.rawSensitivity,
                 timestamp: sample?.timestamp ?? initial.timestamp,
-                contactActive: sample?.contactActive ?? false
+                contactActive: sample?.contactActive ?? false,
+                cancelled: sample?.cancelled ?? true
             )
         }
     }
@@ -806,16 +807,15 @@ final class LauncherController: ObservableObject {
                     return Unmanaged.passUnretained(event)
                 }
                 // System gesture events (rotate/begin/end/gesture/magnify/swipe).
-                // Swallow them only while OUR gesture has a claim: the launcher
-                // is on screen, the live contact's net motion crossed the pinch
-                // begin threshold, or that claim happened within the last 0.6s.
-                // A four-finger spread (negative motion, launcher closed) never
-                // claims — it passes through to the system untouched.
+                // A candidate doesn't own events. Suppress them once a contact
+                // is claimed or while the launcher is already on screen, with
+                // a short grace for trailing events. Show Desktop takes priority.
                 if [18, 19, 20, 29, 30, 31].contains(type.rawValue) {
-                    let presented = c.isPresentedOnScreen
-                    let claimed = RawTrackpadGestureMonitor.hasClaimedPinch
+                    let presented = LauncherController.isPresentedOnScreen
+                    let claimed = RawTrackpadGestureMonitor.hasClaimedGesture
                     let suppressed = RawTrackpadGestureMonitor.isSystemGestureSuppressed
-                    let swallow = presented || claimed || suppressed
+                    let yieldsToDesktop = RawTrackpadGestureMonitor.yieldsToDesktop
+                    let swallow = !yieldsToDesktop && (presented || claimed || suppressed)
                     let eventName: String
                     switch type.rawValue {
                     case 18: eventName = "rotate"
@@ -831,7 +831,7 @@ final class LauncherController: ObservableObject {
                             + " presented=\(presented ? 1 : 0)"
                             + " claimed=\(claimed ? 1 : 0)"
                             + " suppress=\(suppressed ? 1 : 0)"
-                            + " yield=\(RawTrackpadGestureMonitor.yieldsToDesktop ? 1 : 0)"
+                            + " yield=\(yieldsToDesktop ? 1 : 0)"
                     )
                     if swallow {
                         if type.rawValue == 19 {

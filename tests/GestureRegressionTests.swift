@@ -404,31 +404,134 @@ struct GestureRegressionTests {
                     "Distinct fingertips must never merge")
     }
 
+    static func hand(radius: CGFloat, center: CGPoint = CGPoint(x: 0.5, y: 0.5)) -> FourFingerGeometry {
+        FourFingerGeometry(centers: [
+            CGPoint(x: center.x + radius, y: center.y),
+            CGPoint(x: center.x - radius, y: center.y),
+            CGPoint(x: center.x, y: center.y + radius),
+            CGPoint(x: center.x, y: center.y - radius)
+        ])
+    }
+
     static func stableBeginRejectsTransientFourFrames() throws {
         let contact = TrackpadContactState()
         // A single stray four-count frame must not begin a gesture.
-        try require(contact.noteQualifiedFrame(radius: 0.2, at: 100) == nil,
+        try require(contact.noteQualifiedFrame(hand(radius: 0.2), at: 100) == nil,
                     "One stray frame began a contact")
         try require(contact.snapshot(at: 100.5) == nil,
                     "Stray frame produced a generation")
         // Any non-qualifying frame disarms the candidate completely.
         contact.endContact(contactCount: 3, at: 100.01)
-        contact.noteQualifiedFrame(radius: 0.2, at: 101.0)
-        try require(contact.noteQualifiedFrame(radius: 0.2, at: 101.01) == nil
-                        && contact.noteQualifiedFrame(radius: 0.2, at: 101.02) == nil,
+        contact.noteQualifiedFrame(hand(radius: 0.2), at: 101.0)
+        try require(contact.noteQualifiedFrame(hand(radius: 0.18), at: 101.01) == nil
+                        && contact.noteQualifiedFrame(hand(radius: 0.16), at: 101.02) == nil,
                     "Candidate began before the stability window elapsed")
-        let generation = contact.noteQualifiedFrame(radius: 0.2, at: 101.04)
-        try require(generation != nil, "Sustained four-contact frames must begin")
+        let generation = contact.noteQualifiedFrame(hand(radius: 0.16), at: 101.04)
+        try require(generation != nil, "Sustained four-contact frames must claim a coherent pinch")
+        try near(contact.snapshot(for: generation, at: 101.04)!.motion, 0.04,
+                 "Confirmation dropped candidate motion")
         // A long gap between qualified frames restarts the window.
         let restarted = TrackpadContactState()
-        restarted.noteQualifiedFrame(radius: 0.2, at: 200.0)
-        restarted.noteQualifiedFrame(radius: 0.2, at: 200.02)
-        try require(restarted.noteQualifiedFrame(radius: 0.2, at: 200.2) == nil,
+        restarted.noteQualifiedFrame(hand(radius: 0.3), at: 200.0)
+        restarted.noteQualifiedFrame(hand(radius: 0.28), at: 200.02)
+        try require(restarted.noteQualifiedFrame(hand(radius: 0.2), at: 200.2) == nil,
                     "A stale candidate survived a frame gap")
-        try require(restarted.noteQualifiedFrame(radius: 0.2, at: 200.22) == nil,
+        try require(restarted.noteQualifiedFrame(hand(radius: 0.18), at: 200.22) == nil,
                     "Restarted candidate must re-earn its stability window")
-        try require(restarted.noteQualifiedFrame(radius: 0.2, at: 200.24) != nil,
+        try require(restarted.noteQualifiedFrame(hand(radius: 0.16), at: 200.24) != nil,
                     "Fresh sustained frames must begin after restart")
+        try near(restarted.snapshot(at: 200.24)!.motion, 0.04, "Frame gap reused the old baseline")
+    }
+
+    static func directionalClaimRequiresCoherentMotion() throws {
+        let start = ProcessInfo.processInfo.systemUptime
+        for allowsSpread in [false, true] {
+            let contact = TrackpadContactState()
+            for index in 0..<5 {
+                let now = start + Double(index) * 0.012
+                contact.noteQualifiedFrame(hand(radius: 0.17 + CGFloat(index) * 0.01),
+                                           allowsSpread: allowsSpread, at: now)
+            }
+            try require(contact.hasClaimedGesture == allowsSpread,
+                        "Spread should be reserved for the system while the launcher is closed")
+            if allowsSpread {
+                contact.noteQualifiedFrame(hand(radius: 0.22), at: start + 0.06)
+                contact.noteQualifiedFrame(hand(radius: 0.16), at: start + 0.07)
+                try require(contact.hasClaimedGesture, "Reversal lost the existing claim")
+            }
+        }
+
+        for translation in [true, false] {
+            let contact = TrackpadContactState()
+            for index in 0..<6 {
+                let now = start + Double(index) * 0.012
+                let center = CGPoint(x: 0.35 + (translation ? CGFloat(index) * 0.04 : 0), y: 0.5)
+                let radius: CGFloat = translation || index == 0 ? 0.2 : 0.15
+                try require(contact.noteQualifiedFrame(hand(radius: radius, center: center), at: now) == nil,
+                            "Four-finger translation or a single sample jump claimed the gesture")
+            }
+        }
+
+        let thumbPinch = TrackpadContactState()
+        let otherFingers = [
+            CGPoint(x: 0.30, y: 0.60),
+            CGPoint(x: 0.45, y: 0.60),
+            CGPoint(x: 0.60, y: 0.60)
+        ]
+        for index in 0..<5 {
+            let now = start + Double(index) * 0.012
+            let thumb = CGPoint(x: 0.45, y: 0.20 + CGFloat(index) * 0.025)
+            thumbPinch.noteQualifiedFrame(FourFingerGeometry(centers: otherFingers + [thumb]), at: now)
+        }
+        try require(thumbPinch.hasClaimedGesture, "Three agreeing thumb distances should confirm a pinch")
+
+        let yielding = TrackpadContactState()
+        for index in 0..<5 {
+            let now = start + Double(index) * 0.012
+            let radius = 0.2 - CGFloat(index) * 0.01
+            try require(yielding.noteQualifiedFrame(hand(radius: radius), allowsClaim: false, at: now) == nil,
+                        "A contact yielding to Show Desktop claimed the gesture")
+        }
+    }
+
+    static func staggeredLiftAndRepeatedTopologyLoss() throws {
+        for recovers in [false, true] {
+            let contact = TrackpadContactState()
+            let start = ProcessInfo.processInfo.systemUptime
+            var generation: UInt64?
+            for index in 0..<8 {
+                let now = start + Double(index) * 0.01
+                let radius = 0.24 - CGFloat(index) * 0.01
+                if let claimed = contact.noteQualifiedFrame(hand(radius: radius), at: now) {
+                    generation = claimed
+                }
+            }
+            try require(generation != nil, "Test pinch must earn a claim")
+            contact.endContact(contactCount: 3, at: start + 0.08)
+            contact.endContact(contactCount: 3, at: start + 0.09)
+            if recovers {
+                contact.noteQualifiedFrame(hand(radius: 0.18), at: start + 0.10)
+            }
+            contact.endContact(contactCount: 2, at: start + 0.11)
+            if recovers {
+                contact.noteQualifiedFrame(hand(radius: 0.18), at: start + 0.12)
+            } else {
+                contact.endContact(contactCount: 0, at: start + 0.12)
+            }
+            let terminal = contact.snapshot(for: generation, at: start + 0.12)!
+            try require(!terminal.contactActive, "The contact should have ended")
+            try require(terminal.cancelled == recovers,
+                        "Repeated recovered dips must cancel, while a staggered lift must release normally")
+            try near(terminal.motion, 0.07, "Partial-contact frames changed the last valid travel")
+
+            let replay = Replay(base: 0)
+            replay.move(to: 0.45, after: 0.08)
+            replay.box.sample = .init(target: terminal.motion / LauncherGestureAnimator.rawSensitivity,
+                                      timestamp: replay.now + 0.01,
+                                      contactActive: false, cancelled: terminal.cancelled)
+            replay.animator.advanceFrame(at: replay.now + 0.02, duration: 0.02)
+            try replay.assertDestination(recovers ? 0 : 1)
+        }
     }
 
     static func main() {
@@ -449,7 +552,9 @@ struct GestureRegressionTests {
             ("raw contact and animator preserve a between-frame release", contactAndAnimatorRetainBetweenFrameMotion),
             ("presentation cancellation cannot revive an old frame or release", presentationCancellationCannotReviveTracking),
             ("split fingers cluster to a stable contact count", contactClusteringCollapsesSplitFingers),
-            ("transient four-count frames never begin a gesture", stableBeginRejectsTransientFourFrames)
+            ("four-contact stability retains early travel and resets after a frame gap", stableBeginRejectsTransientFourFrames),
+            ("only coherent directional motion can claim a four-finger gesture", directionalClaimRequiresCoherentMotion),
+            ("staggered lift releases and repeated topology loss cancels", staggeredLiftAndRepeatedTopologyLoss)
         ]
         var failures = 0
         for (name, test) in tests {
