@@ -430,6 +430,7 @@ struct PreviewWindow: Identifiable, Hashable {
     var isFullscreen: Bool
     let lastAccessedTime: Date
     var image: CGImage?
+    var captureSource: SCWindow? = nil
 
     func hash(into hasher: inout Hasher) {
         hasher.combine(id)
@@ -829,7 +830,7 @@ enum PreviewWindowUtil {
         guard !axWindows.isEmpty else { return [] }
 
         let cgCandidates = cgWindowCandidates(for: pid)
-        let scBackedWindowIDs = await screenCaptureWindowIDs(for: pid)
+        let captureSources = await screenCaptureWindows(for: pid)
         let activeSpaceIDs = currentActiveSpaceIDs()
 
         let captureImages = shouldCaptureWindowImages()
@@ -848,7 +849,7 @@ enum PreviewWindowUtil {
                         appAX: appAX,
                         captureImage: captureImages,
                         cgCandidates: cgCandidates,
-                        scBackedWindowIDs: scBackedWindowIDs,
+                        captureSources: captureSources,
                         activeSpaceIDs: activeSpaceIDs
                     )
                 }
@@ -886,7 +887,7 @@ enum PreviewWindowUtil {
         appAX: AXUIElement,
         captureImage: Bool,
         cgCandidates: [[String: AnyObject]],
-        scBackedWindowIDs: Set<CGWindowID>,
+        captureSources: [CGWindowID: SCWindow],
         activeSpaceIDs: Set<Int>
     ) async throws -> PreviewWindow? {
         guard let windowID = try? element.cgWindowId(), windowID != 0 else { return nil }
@@ -932,7 +933,7 @@ enum PreviewWindowUtil {
         let isFullscreen = (try? element.isFullscreen()) ?? false
         let isHidden = app.isHidden
         let isOnscreen = (cgEntry[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue ?? false
-        let isSCBacked = scBackedWindowIDs.contains(windowID)
+        let captureSource = captureSources[windowID]
         let windowSpaces = Set(windowID.cgsSpaces().map { Int($0) })
         let isOnActiveSpace = !windowSpaces.isEmpty && !windowSpaces.isDisjoint(with: activeSpaceIDs)
 
@@ -940,7 +941,7 @@ enum PreviewWindowUtil {
         // are neither visible, minimized, fullscreen nor part of a hidden app.
         let isGhostWindow = !isOnscreen && isOnActiveSpace && !isMinimized && !isFullscreen && !isHidden
         guard !isGhostWindow else { return nil }
-        if !isOnscreen && !isSCBacked && !isMinimized && !isFullscreen && !isHidden {
+        if !isOnscreen && captureSource == nil && !isMinimized && !isFullscreen && !isHidden {
             // A valid normal window on another Space is intentionally kept
             // when “current Space only” is disabled. CGS can capture it even
             // though CGWindowList marks it offscreen.
@@ -976,7 +977,8 @@ enum PreviewWindowUtil {
             isHidden: isHidden,
             isFullscreen: isFullscreen,
             lastAccessedTime: Date(),
-            image: image
+            image: image,
+            captureSource: captureSource
         )
     }
 
@@ -994,22 +996,20 @@ enum PreviewWindowUtil {
     /// ScreenCaptureKit returns real windows across all Spaces. Unlike
     /// `kCGWindowIsOnscreen`, this remains usable for windows that live on a
     /// different desktop and also avoids accepting stale AX-only surfaces.
-    nonisolated private static func screenCaptureWindowIDs(for pid: pid_t) async -> Set<CGWindowID> {
+    nonisolated static func screenCaptureWindows(for pid: pid_t) async -> [CGWindowID: SCWindow] {
         guard shouldCaptureWindowImages(),
               let content = try? await SCShareableContent.excludingDesktopWindows(
                   false,
                   onScreenWindowsOnly: false
               )
-        else { return [] }
+        else { return [:] }
 
-        return Set(content.windows.compactMap { window in
-            guard window.owningApplication?.processID == pid,
-                  window.windowLayer == 0,
-                  window.frame.width >= 100,
-                  window.frame.height >= 50
-            else { return nil }
-            return window.windowID
-        })
+        return content.windows.reduce(into: [:]) { result, window in
+            if window.owningApplication?.processID == pid, window.windowLayer == 0,
+               window.frame.width >= 100, window.frame.height >= 50 {
+                result[window.windowID] = window
+            }
+        }
     }
 
     /// Preserve the Window Server's front-to-back ordering. The previous

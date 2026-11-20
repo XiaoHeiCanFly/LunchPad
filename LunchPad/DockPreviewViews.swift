@@ -3,6 +3,7 @@
 // Copyright (C) 2024 ejbills.
 
 import AppKit
+import Combine
 import QuartzCore
 import SwiftUI
 
@@ -62,144 +63,16 @@ extension View {
     }
 }
 
-// MARK: - Glass background (DockDoor BlurView / liquid glass)
-
-/// The Tahoe liquid-glass surface used for the container and cards.
-struct GlassBlurView: View {
-    let cornerRadius: CGFloat
-
-    var body: some View {
-        DockLiquidGlassRepresentable(cornerRadius: cornerRadius)
-    }
-}
-
-/// DockDoor's native macOS 26 Liquid Glass implementation. A native
-/// `NSGlassEffectView` is required here because the preview is a nonactivating
-/// floating panel; SwiftUI's `glassEffect` does not keep the same backdrop
-/// quality and saturation in that window configuration.
-@available(macOS 26.0, *)
-private struct DockLiquidGlassRepresentable: NSViewRepresentable {
-    let cornerRadius: CGFloat
-
-    func makeNSView(context: Context) -> DockLiquidGlassContainerView {
-        let view = DockLiquidGlassContainerView()
-        view.cornerRadius = cornerRadius
-        view.updateCornerRadius()
+private struct PreviewBackdrop: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = .popover
+        view.blendingMode = .behindWindow
+        view.state = .active
         return view
     }
 
-    func updateNSView(_ view: DockLiquidGlassContainerView, context: Context) {
-        view.cornerRadius = cornerRadius
-        view.updateCornerRadius()
-        view.applyAppearance()
-    }
-}
-
-@available(macOS 26.0, *)
-private final class DockLiquidGlassContainerView: NSView {
-    var cornerRadius: CGFloat = 14
-
-    private let glassOpacity: CGFloat = 0.95
-    private let tintOpacity: CGFloat = 0.18
-    private let saturation: CGFloat = 1.8
-    private let glassVariant = 4
-
-    private var glassView: NSGlassEffectView?
-    private var tintView: NSView?
-    private var backdropLayers: [CALayer] = []
-    private var configuredBackdrop = false
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        setupGlass()
-    }
-
-    required init?(coder: NSCoder) {
-        super.init(coder: coder)
-        setupGlass()
-    }
-
-    private func setupGlass() {
-        wantsLayer = true
-        layer?.cornerCurve = .continuous
-        layer?.masksToBounds = true
-
-        let tint = NSView()
-        tint.translatesAutoresizingMaskIntoConstraints = false
-        tint.wantsLayer = true
-        addSubview(tint)
-
-        let glass = NSGlassEffectView()
-        glass.style = .clear
-        setNativeVariant(on: glass, glassVariant)
-        glass.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(glass)
-
-        for view in [tint, glass] {
-            NSLayoutConstraint.activate([
-                view.topAnchor.constraint(equalTo: topAnchor),
-                view.leadingAnchor.constraint(equalTo: leadingAnchor),
-                view.trailingAnchor.constraint(equalTo: trailingAnchor),
-                view.bottomAnchor.constraint(equalTo: bottomAnchor),
-            ])
-        }
-
-        tintView = tint
-        glassView = glass
-        applyAppearance()
-    }
-
-    func updateCornerRadius() {
-        layer?.cornerRadius = cornerRadius
-    }
-
-    func applyAppearance() {
-        glassView?.alphaValue = glassOpacity
-        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        tintView?.layer?.backgroundColor = (isDark ? NSColor.black : NSColor.white)
-            .withAlphaComponent(tintOpacity).cgColor
-        for backdrop in backdropLayers {
-            backdrop.setValue(true, forKey: "windowServerAware")
-            backdrop.setValue(1.0, forKey: "scale")
-            backdrop.setValue(saturation, forKey: "saturationFactor")
-        }
-    }
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        guard window != nil, !configuredBackdrop else { return }
-        configuredBackdrop = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-            self?.configureBackdropLayers()
-        }
-    }
-
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        applyAppearance()
-    }
-
-    private func setNativeVariant(on view: NSView, _ variant: Int) {
-        let selector = NSSelectorFromString("set_variant:")
-        guard view.responds(to: selector), let implementation = view.method(for: selector) else { return }
-        typealias Setter = @convention(c) (NSObject, Selector, Int64) -> Void
-        unsafeBitCast(implementation, to: Setter.self)(view, selector, Int64(variant))
-    }
-
-    private func configureBackdropLayers() {
-        guard let rootLayer = glassView?.layer else { return }
-        backdropLayers = collectBackdropLayers(in: rootLayer)
-        applyAppearance()
-    }
-
-    private func collectBackdropLayers(in layer: CALayer) -> [CALayer] {
-        var result: [CALayer] = []
-        if NSStringFromClass(type(of: layer)).contains("CABackdropLayer") {
-            result.append(layer)
-        }
-        layer.sublayers?.forEach { result.append(contentsOf: collectBackdropLayers(in: $0)) }
-        return result
-    }
+    func updateNSView(_ view: NSVisualEffectView, context: Context) {}
 }
 
 /// Directional rim-light stroke that reads as lit glass (DockDoor's border).
@@ -241,7 +114,7 @@ struct DockStyleModifier: ViewModifier {
     func body(content: Content) -> some View {
         content
             .background {
-                GlassBlurView(cornerRadius: cornerRadius)
+                PreviewBackdrop()
                     .borderedBackground(glassBorderGradient(opacity: 0.15), lineWidth: 1, shape: shape)
                     .opacity(backgroundOpacity)
                     .clipShape(shape)
@@ -270,7 +143,7 @@ extension View {
         padding(.horizontal, 6)
             .padding(.vertical, 3)
             .background {
-                GlassBlurView(cornerRadius: 11)
+                Capsule(style: .continuous).fill(.primary.opacity(0.06))
             }
             .clipShape(Capsule(style: .continuous))
             .borderedBackground(.primary.opacity(0.1), lineWidth: 1.5, shape: Capsule(style: .continuous))
@@ -541,17 +414,19 @@ struct PreviewWindowCard: View {
     let window: PreviewWindow
     let dimensions: CGSize
     let maxDimensions: CGSize
-    let isSelected: Bool
+    let selection: CurrentValueSubject<CGWindowID?, Never>
     let onWindowTap: (() -> Void)?
     fileprivate let onWindowAction: (WindowCardAction) -> Void
+    @State private var thumbnailVisible = false
 
-    @State private var isHovering = false
+    private var selectionChanges: AnyPublisher<Bool, Never> {
+        let windowID = window.id
+        return selection.map { $0 == windowID }.removeDuplicates().eraseToAnyPublisher()
+    }
 
     private var isInactive: Bool {
         (window.isMinimized || window.isHidden) && Defaults.shared.showMinimizedHiddenLabels
     }
-
-    private var finalIsSelected: Bool { isSelected || isHovering }
 
     private var cornerRadius: Double {
         CardRadius.base + (CardRadius.innerPadding * Defaults.shared.globalPaddingMultiplier)
@@ -583,10 +458,11 @@ struct PreviewWindowCard: View {
     var body: some View {
         previewCoreContent
             .fixedSize()
-            .contentShape(Rectangle())
-            .onHover { hovering in
-                isHovering = hovering
+            .background {
+                PreviewCardMarker(windowID: window.id)
             }
+            .onScrollVisibilityChange(threshold: 0.01) { thumbnailVisible = $0 }
+            .contentShape(Rectangle())
             .onTapGesture {
                 if window.isMinimized {
                     onWindowAction(.minimize)
@@ -646,21 +522,12 @@ struct PreviewWindowCard: View {
             .frame(width: dimensions.width)
             .background {
                 let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                GlassBlurView(cornerRadius: cornerRadius)
-                    .clipShape(shape)
+                shape.fill(Color(nsColor: .windowBackgroundColor).opacity(0.45))
                     .borderedBackground(.primary.opacity(0.1), lineWidth: 1.75, shape: shape)
                     .overlay {
-                        if finalIsSelected {
-                            let highlightColor = Color(nsColor: .controlAccentColor)
-                            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                                .fill(highlightColor.opacity(Defaults.shared.selectionOpacity))
-                        }
-                    }
-                    .overlay {
-                        if finalIsSelected {
-                            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                                .strokeBorder(Color(nsColor: .controlAccentColor), lineWidth: 2.5)
-                        }
+                        shape.fill(Color(nsColor: .controlAccentColor).opacity(Defaults.shared.selectionOpacity))
+                            .modifier(PreviewSelectionOpacity(changes: selectionChanges, unselected: 0))
+                            .allowsHitTesting(false)
                     }
             }
             .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
@@ -669,7 +536,10 @@ struct PreviewWindowCard: View {
 
     private var windowContent: some View {
         Group {
-            if let image = window.image {
+            if let source = window.captureSource {
+                DockLiveThumbnail(source: source, snapshot: window.image, visible: thumbnailVisible)
+                    .allowsHitTesting(false)
+            } else if let image = window.image {
                 Image(decorative: image, scale: 1)
                     .resizable()
                     .scaledToFit()
@@ -698,7 +568,7 @@ struct PreviewWindowCard: View {
             height: max(dimensions.height - CardRadius.innerPadding * 2, 50),
             alignment: .center
         )
-        .opacity(finalIsSelected ? 1.0 : Defaults.shared.unselectedContentOpacity)
+        .modifier(PreviewSelectionOpacity(changes: selectionChanges, unselected: Defaults.shared.unselectedContentOpacity))
     }
 
     @ViewBuilder
@@ -726,7 +596,7 @@ struct PreviewWindowCard: View {
                 }
             }
             .padding(2)
-            .opacity((finalIsSelected || isHovering) ? 1.0 : 0.25)
+            .modifier(PreviewSelectionOpacity(changes: selectionChanges, unselected: 0.25))
             .materialPill()
         } else if window.isMinimized || window.isHidden {
             // 与流量灯按钮（14pt 图标 + 2pt 内边距 + 胶囊）完全同构同高，
@@ -753,7 +623,6 @@ struct DockPreviewHoverContainer: View {
     @ObservedObject var state: DockPreviewState
 
     @State private var appIcon: NSImage?
-    @State private var scrolledFromStart = false
 
     private var isHorizontal: Bool { dockPosition.isHorizontalFlow }
 
@@ -839,10 +708,12 @@ struct DockPreviewHoverContainer: View {
             .frame(alignment: .topLeading)
             .globalPadding(HoverContainerPadding.contentInner)
         }
-        .trackScrollOffset(axis: isHorizontal ? .horizontal : .vertical, scrolledFromStart: $scrolledFromStart)
+        .onScrollGeometryChange(for: CGPoint.self) { $0.contentOffset } action: { _, _ in
+            state.surface?.scheduleHighlightUpdate()
+        }
+        .background { PreviewGridViewport() }
         .padding(HoverContainerPadding.scrollOuter)
         .animation(Defaults.shared.showAnimations ? .smooth(duration: 0.1) : nil, value: state.windows.count)
-        .fadeOnEdges(axis: isHorizontal ? .horizontal : .vertical, fadeLength: 20, disableLeading: !scrolledFromStart)
         .padding(.top, (Defaults.shared.showAppName) ? 25 : 0)
         .overlay(alignment: .topLeading) {
             if Defaults.shared.showAppName {
@@ -890,7 +761,7 @@ struct DockPreviewHoverContainer: View {
                 window: window,
                 dimensions: size,
                 maxDimensions: overallMaxDimensions,
-                isSelected: state.selectionIndex == index,
+                selection: state.selection,
                 onWindowTap: onWindowTap,
                 onWindowAction: { action in
                     handleWindowAction(action, window: window, index: index)
@@ -912,7 +783,17 @@ struct DockPreviewHoverContainer: View {
             var updated = window
             if updated.toggleMinimize() != nil {
                 state.windows[index] = updated
-                // 保留最后捕获的窗口内容，最小化卡片仍显示窗口画面。
+                // A window that was already minimized at discovery can become
+                // shareable for the first time when restored from this panel.
+                if !updated.isMinimized, updated.captureSource == nil {
+                    let pid = updated.app.processIdentifier
+                    Task {
+                        let sources = await PreviewWindowUtil.screenCaptureWindows(for: pid)
+                        guard let source = sources[updated.id],
+                              let current = state.windows.firstIndex(of: updated) else { return }
+                        state.windows[current].captureSource = source
+                    }
+                }
             }
         case .toggleFullScreen:
             var updated = window
@@ -957,50 +838,73 @@ struct BaseHoverContainer<Content: View>: View {
     }
 }
 
-// MARK: - Scroll modifiers (DockDoor fadeOnEdges / trackScrollOffset)
+private struct PreviewSelectionOpacity: ViewModifier {
+    let changes: AnyPublisher<Bool, Never>
+    let unselected: Double
+    @State private var selected = false
 
-extension View {
-    func trackScrollOffset(axis: Axis.Set, scrolledFromStart: Binding<Bool>) -> some View {
-        onScrollGeometryChange(for: Bool.self) { geo in
-            let offset = axis == .vertical ? geo.contentOffset.y : geo.contentOffset.x
-            return offset > 1
-        } action: { _, isScrolled in
-            scrolledFromStart.wrappedValue = isScrolled
+    func body(content: Content) -> some View {
+        content
+            .opacity(selected ? 1 : unselected)
+            .onReceive(changes) { selected = $0 }
+    }
+}
+
+private struct PreviewGridViewport: NSViewRepresentable {
+    func makeNSView(context: Context) -> ViewportView { ViewportView() }
+    func updateNSView(_ view: ViewportView, context: Context) {}
+
+    final class ViewportView: NSView {
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard let surface = window?.contentView as? DockPreviewSurface else { return }
+            surface.gridViewport = self
+            surface.scheduleHighlightUpdate()
         }
     }
+}
 
-    func fadeOnEdges(axis: Axis, fadeLength: Double, disableLeading: Bool = false, disableTrailing: Bool = false) -> some View {
-        mask {
-            GeometryReader { geo in
-                let containerSize = axis == .horizontal ? geo.size.width : geo.size.height
-                let fadeLength = min(fadeLength, containerSize * 0.05)
-                HStack(spacing: 0) {
-                    if disableLeading {
-                        Color.black
-                            .frame(width: axis == .horizontal ? fadeLength : nil, height: axis == .vertical ? fadeLength : nil)
-                    } else {
-                        LinearGradient(
-                            gradient: Gradient(colors: [.black.opacity(0), .black]),
-                            startPoint: axis == .horizontal ? .leading : .top,
-                            endPoint: axis == .horizontal ? .trailing : .bottom
-                        )
-                        .frame(width: axis == .horizontal ? fadeLength : nil, height: axis == .vertical ? fadeLength : nil)
-                    }
-                    Color.black.frame(maxWidth: .infinity)
-                    if disableTrailing {
-                        Color.black
-                            .frame(width: axis == .horizontal ? fadeLength : nil, height: axis == .vertical ? fadeLength : nil)
-                    } else {
-                        LinearGradient(
-                            gradient: Gradient(colors: [.black.opacity(0), .black]),
-                            startPoint: axis == .horizontal ? .trailing : .bottom,
-                            endPoint: axis == .horizontal ? .leading : .top
-                        )
-                        .frame(width: axis == .horizontal ? fadeLength : nil, height: axis == .vertical ? fadeLength : nil)
-                    }
-                }
-            }
-        }
+private struct PreviewCardMarker: NSViewRepresentable {
+    let windowID: CGWindowID
+
+    func makeNSView(context: Context) -> PreviewCardAnchorView {
+        PreviewCardAnchorView(windowID: windowID)
+    }
+
+    func updateNSView(_ view: PreviewCardAnchorView, context: Context) {}
+}
+
+final class PreviewCardAnchorView: NSView {
+    let windowID: CGWindowID
+    private weak var surface: DockPreviewSurface?
+
+    init(windowID: CGWindowID) {
+        self.windowID = windowID
+        super.init(frame: .zero)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        surface?.unregister(self)
+        surface = window?.contentView as? DockPreviewSurface
+        surface?.register(self)
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        surface?.scheduleHighlightUpdate()
+    }
+
+    override func setFrameOrigin(_ newOrigin: NSPoint) {
+        super.setFrameOrigin(newOrigin)
+        surface?.scheduleHighlightUpdate()
     }
 }
 
@@ -1111,7 +1015,9 @@ final class DockPreviewTrackingView: NSView {
 
     override func mouseExited(with event: NSEvent) {
         guard !isHiding else { return }
-        DockPreviewPanel.shared.mouseIsWithinPreviewWindow = false
+        let panel = DockPreviewPanel.shared
+        guard window === panel else { return }
+        panel.mouseIsWithinPreviewWindow = false
     }
 
     private func startFadeOut() {

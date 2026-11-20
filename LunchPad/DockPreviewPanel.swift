@@ -11,7 +11,184 @@ import SwiftUI
 @MainActor
 final class DockPreviewState: ObservableObject {
     @Published var windows: [PreviewWindow] = []
-    @Published var selectionIndex: Int = -1
+    let selection = CurrentValueSubject<CGWindowID?, Never>(nil)
+    weak var surface: DockPreviewSurface?
+
+    var selectedIndex: Int? {
+        windows.firstIndex { $0.id == selection.value }
+    }
+}
+
+final class DockPreviewSurface: NSView {
+    private let hostingView: NSHostingView<DockPreviewHoverContainer>
+    private let state: DockPreviewState
+    private let anchors = NSMapTable<NSNumber, PreviewCardAnchorView>.strongToWeakObjects()
+    weak var gridViewport: NSView?
+    private let highlightOverlay = DockPreviewHighlightOverlay(frame: .zero)
+    private var pointerTimer: Timer?
+    private var lastPointerInWindow: NSPoint?
+    private var lastPointerOnScreen: NSPoint?
+    private var highlightUpdateScheduled = false
+    private(set) var isKeyboardSelecting = false
+
+    init(content: DockPreviewHoverContainer, state: DockPreviewState) {
+        hostingView = NSHostingView(rootView: content)
+        self.state = state
+        super.init(frame: .zero)
+        state.surface = self
+
+        hostingView.autoresizingMask = [.width, .height]
+        addSubview(hostingView)
+        highlightOverlay.frame = bounds
+        highlightOverlay.autoresizingMask = [.width, .height]
+        highlightOverlay.wantsLayer = true
+        highlightOverlay.layerContentsRedrawPolicy = .onSetNeedsDisplay
+        addSubview(highlightOverlay, positioned: .above, relativeTo: hostingView)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override var fittingSize: NSSize { hostingView.fittingSize }
+
+    override func layout() {
+        super.layout()
+        scheduleHighlightUpdate()
+    }
+
+    func startPointerTracking() {
+        guard pointerTimer == nil else { return }
+        let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.samplePointer() }
+        }
+        pointerTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+        samplePointer()
+    }
+
+    func stopPointerTracking() {
+        guard let pointerTimer else { return }
+        pointerTimer.invalidate()
+        self.pointerTimer = nil
+    }
+
+    private func samplePointer() {
+        guard let window, window.isVisible, state.surface === self else {
+            stopPointerTracking()
+            return
+        }
+        let screenPoint = NSEvent.mouseLocation
+        let pointer = window.convertPoint(fromScreen: screenPoint)
+        let pointerMoved = lastPointerOnScreen.map { $0 != screenPoint } ?? false
+        if lastPointerInWindow != pointer || pointerMoved {
+            if pointerMoved {
+                isKeyboardSelecting = false
+            }
+            lastPointerInWindow = pointer
+            lastPointerOnScreen = screenPoint
+            updateHighlight(pointerInWindow: pointer)
+        }
+    }
+
+    func register(_ anchor: PreviewCardAnchorView) {
+        anchors.setObject(anchor, forKey: NSNumber(value: anchor.windowID))
+        scheduleHighlightUpdate()
+    }
+
+    func unregister(_ anchor: PreviewCardAnchorView) {
+        let key = NSNumber(value: anchor.windowID)
+        if anchors.object(forKey: key) === anchor {
+            anchors.removeObject(forKey: key)
+            scheduleHighlightUpdate()
+        }
+    }
+
+    func selectWithKeyboard(index: Int) {
+        guard state.windows.indices.contains(index) else { return }
+        isKeyboardSelecting = true
+        setSelection(state.windows[index].id)
+        updateHighlight()
+    }
+
+    func scheduleHighlightUpdate() {
+        guard !highlightUpdateScheduled else { return }
+        highlightUpdateScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            highlightUpdateScheduled = false
+            updateHighlight()
+        }
+    }
+
+    private func updateHighlight(pointerInWindow: NSPoint? = nil) {
+        guard let window, window.isVisible, state.surface === self else { return }
+        let point = convert(pointerInWindow ?? window.mouseLocationOutsideOfEventStream, from: nil)
+        let viewport = gridViewport.map { convert($0.bounds, from: $0).intersection(bounds) } ?? bounds
+        let currentID = isKeyboardSelecting ? state.selection.value : state.windows.first { preview in
+            guard let anchor = anchors.object(forKey: NSNumber(value: preview.id)) else { return false }
+            return viewport.contains(point) && convert(anchor.bounds, from: anchor).contains(point)
+        }?.id
+
+        guard let currentID, let anchor = anchors.object(forKey: NSNumber(value: currentID)) else {
+            highlightOverlay.setOutline(nil)
+            if !isKeyboardSelecting || state.selectedIndex == nil { setSelection(nil) }
+            return
+        }
+
+        let card = highlightOverlay.convert(anchor.bounds, from: anchor)
+        let clip = card.intersection(highlightOverlay.convert(viewport, from: self))
+        highlightOverlay.setOutline(clip.isEmpty ? nil : .init(card: card, clip: clip))
+        setSelection(currentID)
+    }
+
+    private func setSelection(_ id: CGWindowID?) {
+        if state.selection.value != id {
+            state.selection.send(id)
+        }
+    }
+
+}
+
+private final class DockPreviewHighlightOverlay: NSView {
+    struct Outline: Equatable {
+        let card: NSRect
+        let clip: NSRect
+    }
+
+    private var outline: Outline?
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    func setOutline(_ next: Outline?) {
+        guard outline != next else { return }
+        let dirty = (outline?.clip ?? .null).union(next?.clip ?? .null)
+        outline = next
+        setNeedsDisplay(dirty.insetBy(dx: -1, dy: -1))
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        context.clear(dirtyRect)
+        guard let outline else { return }
+
+        let lineWidth: CGFloat = 2.5
+        let inset = lineWidth / 2
+        let radius = max(0, CardRadius.base + CardRadius.innerPadding * Defaults.shared.globalPaddingMultiplier - inset)
+        let path = CGPath(roundedRect: outline.card.insetBy(dx: inset, dy: inset),
+                          cornerWidth: radius, cornerHeight: radius, transform: nil)
+        context.saveGState()
+        context.clip(to: outline.clip)
+        context.setLineWidth(lineWidth)
+        context.setStrokeColor(NSColor.controlAccentColor.cgColor)
+        context.addPath(path)
+        context.strokePath()
+        context.restoreGState()
+    }
 }
 
 // MARK: - Preview panel (DockDoor's SharedPreviewWindowCoordinator)
@@ -111,8 +288,10 @@ final class DockPreviewPanel: NSPanel {
         closeResizeGraceDeadline = nil
         guard isVisible else { return }
 
-        let cleanup = { [weak self] in
-            guard let self else { return }
+        let cleanup = { [weak self, weak retiringView = contentView] in
+            // An animated dismissal can finish after another app has already
+            // installed its cards and started its own capture streams.
+            guard let self, let retiringView, contentView === retiringView else { return }
             // Make the preview disappear before touching its SwiftUI/image
             // graph. Clearing state.windows and destroying NSHostingView used
             // to happen synchronously here, blocking launcher activation for
@@ -121,6 +300,7 @@ final class DockPreviewPanel: NSPanel {
             orderOut(nil)
 
             let retiredContentView = contentView
+            (retiredContentView as? DockPreviewSurface)?.stopPointerTracking()
             let retiredState = state
             state = DockPreviewState()
             contentView = nil
@@ -252,6 +432,7 @@ final class DockPreviewPanel: NSPanel {
 
         self.onWindowTap = onWindowTap
         currentlyDisplayedPID = windows.first?.app.processIdentifier
+        state.selection.send(nil)
         state.windows = windows
         Self.presentationFlag.set(true)
 
@@ -281,14 +462,15 @@ final class DockPreviewPanel: NSPanel {
             dockItemElement: dockItemElement,
             state: state
         )
-        let newHostingView = NSHostingView(rootView: hoverView)
+        let surface = DockPreviewSurface(content: hoverView, state: state)
 
         if let oldContentView = contentView {
+            (oldContentView as? DockPreviewSurface)?.stopPointerTracking()
             oldContentView.removeFromSuperview()
         }
-        contentView = newHostingView
+        contentView = surface
 
-        let fittingSize = newHostingView.fittingSize
+        let fittingSize = surface.fittingSize
         let panelGutter: CGFloat = 16
         let newHoverWindowSize = CGSize(
             width: min(fittingSize.width, max(1, mouseScreen.visibleFrame.width - panelGutter * 2)),
@@ -312,6 +494,8 @@ final class DockPreviewPanel: NSPanel {
         applyWindowFrame(finalFrame, animated: animated)
         previousHoverWindowOrigin = position
         refreshPanelFrameToFitContent()
+        surface.startPointerTracking()
+        surface.scheduleHighlightUpdate()
     }
 
     /// Merges refreshed windows when the displayed app is unchanged.
@@ -320,6 +504,7 @@ final class DockPreviewPanel: NSPanel {
         guard currentlyDisplayedPID == pid else { return false }
         state.windows = windows
         refreshPanelFrameToFitContent()
+        state.surface?.scheduleHighlightUpdate()
         return true
     }
 
@@ -342,10 +527,9 @@ final class DockPreviewPanel: NSPanel {
             return
         }
 
-        if state.selectionIndex > removedIndex {
-            state.selectionIndex -= 1
-        } else if state.selectionIndex == removedIndex {
-            state.selectionIndex = min(removedIndex, state.windows.count - 1)
+        if state.selection.value == windowID, let surface = contentView as? DockPreviewSurface,
+           surface.isKeyboardSelecting {
+            surface.selectWithKeyboard(index: min(removedIndex, state.windows.count - 1))
         }
 
         // Let SwiftUI commit the shorter card list before asking the hosting
@@ -384,9 +568,9 @@ final class DockPreviewPanel: NSPanel {
 
     private func navigateWithArrowKey(direction: ArrowDirection) {
         let count = state.windows.count
-        guard count > 0 else { return }
-        if state.selectionIndex < 0 {
-            state.selectionIndex = 0
+        guard count > 0, let surface = contentView as? DockPreviewSurface else { return }
+        guard let currentIndex = state.selectedIndex else {
+            surface.selectWithKeyboard(index: 0)
             return
         }
         let bestGuessMonitor = NSScreen.screenFromQuartzPoint(DockHoverObserver.getMousePosition())
@@ -404,8 +588,8 @@ final class DockPreviewPanel: NSPanel {
             totalItems: count
         )
         let shouldReverse = currentDockPosition == .bottom || currentDockPosition == .right
-        state.selectionIndex = PreviewDimensionCalculator.navigateInGrid(
-            from: state.selectionIndex,
+        let nextIndex = PreviewDimensionCalculator.navigateInGrid(
+            from: currentIndex,
             direction: direction,
             totalItems: count,
             isHorizontal: currentDockPosition.isHorizontalFlow,
@@ -413,11 +597,11 @@ final class DockPreviewPanel: NSPanel {
             maxRows: maxRows,
             reverse: shouldReverse
         )
+        surface.selectWithKeyboard(index: nextIndex)
     }
 
     private func selectAndBringToFrontCurrentWindow() {
-        let index = state.selectionIndex
-        guard index >= 0, index < state.windows.count else {
+        guard let index = state.selectedIndex else {
             hideWindow()
             return
         }

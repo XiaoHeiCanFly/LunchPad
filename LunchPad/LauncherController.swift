@@ -212,7 +212,7 @@ final class LauncherController: ObservableObject {
         // Defensive: if a drag was interrupted without ever reaching a drop,
         // make sure the launcher never reappears with a stuck dragged icon.
         store.endDrag()
-        guard !isPresented || animator.visualProgress < 0.99 || animator.isActive else {
+        guard !isPresented || animator.visualProgress < 0.99 || animator.isActive || panelsOutsideActiveSpace else {
             diagnosticRecord("presentation", "show-skipped id=\(attemptID.uuidString) reason=already-presented \(diagnosticPanelsSummary())")
             schedulePresentationProbes(for: attemptID)
             return
@@ -299,7 +299,11 @@ final class LauncherController: ObservableObject {
 
     func toggle() {
         diagnosticRecord("presentation", "toggle intent=\(showIntent) presented=\(isPresented) progress=\(diagnosticNumber(animator.visualProgress))")
-        showIntent ? hide() : show()
+        if showIntent && !panelsOutsideActiveSpace {
+            hide()
+        } else {
+            show()
+        }
     }
 
     // MARK: - Presentation helpers
@@ -359,13 +363,15 @@ final class LauncherController: ObservableObject {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 guard let self, self.presentationAttemptID == attemptID else { return }
                 let visiblePanelCount = self.panels.filter(\.isVisible).count
+                let activeSpacePanelCount = self.panels.filter(\.isOnActiveSpace).count
                 let layerVisibleCount = self.panels.filter {
                     ($0.contentView?.layer?.opacity ?? 0) > 0.02
                 }.count
-                let anomalous = self.isPresented && (visiblePanelCount == 0 || layerVisibleCount == 0)
+                let anomalous = self.isPresented && (visiblePanelCount == 0 || layerVisibleCount == 0
+                    || (delay >= 0.35 && activeSpacePanelCount < self.panels.count))
                 self.diagnosticRecord(
                     anomalous ? "error" : "probe",
-                    "show-probe id=\(attemptID.uuidString) delay=\(String(format: "%.2f", delay)) presented=\(self.isPresented) intent=\(self.showIntent) progress=\(self.diagnosticNumber(self.animator.visualProgress)) visiblePanels=\(visiblePanelCount) visibleLayers=\(layerVisibleCount) appActive=\(NSApp.isActive) \(self.diagnosticPanelsSummary())"
+                    "show-probe id=\(attemptID.uuidString) delay=\(String(format: "%.2f", delay)) presented=\(self.isPresented) intent=\(self.showIntent) progress=\(self.diagnosticNumber(self.animator.visualProgress)) visiblePanels=\(visiblePanelCount) visibleLayers=\(layerVisibleCount) activeSpacePanels=\(activeSpacePanelCount) appActive=\(NSApp.isActive) \(self.diagnosticPanelsSummary())"
                 )
             }
         }
@@ -540,7 +546,7 @@ final class LauncherController: ObservableObject {
               initial.generation == generation,
               rawGestureGeneration != generation else { return }
         if animator.isTracking { animator.endTracking() }
-        if !isPresented { preparePresentationPanelsIfNeeded() }
+        if !isPresented || panelsOutsideActiveSpace { preparePresentationPanelsIfNeeded() }
         guard !panels.isEmpty else { return }
         diagnosticRecord("gesture", "raw-begin generation=\(generation) presented=\(isPresented) progress=\(diagnosticNumber(animator.visualProgress))")
         isPinching = true
@@ -600,7 +606,7 @@ final class LauncherController: ObservableObject {
         guard animator.isTracking || (!ended && !cancelled) else { return }
         if event.phase.contains(.began) || !animator.isTracking {
             if animator.isTracking { animator.endTracking(cancelled: true) }
-            if !isPresented { preparePresentationPanelsIfNeeded() }
+            if !isPresented || panelsOutsideActiveSpace { preparePresentationPanelsIfNeeded() }
             guard !panels.isEmpty else { return }
             isPinching = true
             magnifyOffset = 0
@@ -1242,14 +1248,19 @@ final class LauncherController: ObservableObject {
         if isPresented { panels.forEach { $0.orderFront(nil) } }
     }
 
+    private var panelsOutsideActiveSpace: Bool {
+        panels.contains { !$0.isOnActiveSpace }
+    }
+
     private func preparePresentationPanelsIfNeeded() {
         guard let screen = presentationScreen() else {
             diagnosticRecord("error", "prepare-panels-no-screen mode=\(displayMode)")
             return
         }
         let requestedDisplayID = displayID(for: screen)
-        let needsRebuild = panels.isEmpty || panelDisplayID != requestedDisplayID
-        diagnosticRecord("panel", "prepare mode=\(displayMode) requested=\(requestedDisplayID) current=\(panelDisplayID ?? -1) panels=\(panels.count) rebuild=\(needsRebuild)")
+        let outsideActiveSpace = panelsOutsideActiveSpace
+        let needsRebuild = panels.isEmpty || panelDisplayID != requestedDisplayID || outsideActiveSpace
+        diagnosticRecord("panel", "prepare mode=\(displayMode) requested=\(requestedDisplayID) current=\(panelDisplayID ?? -1) panels=\(panels.count) outsideActiveSpace=\(outsideActiveSpace) rebuild=\(needsRebuild)")
         if needsRebuild { rebuildPanels() }
     }
 
